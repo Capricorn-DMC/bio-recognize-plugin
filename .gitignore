@@ -1,0 +1,14 @@
+# 运行时数据（含用户生物特征、锁屏密码、采集文件）— 不入库
+models/
+
+# Node
+node_modules/
+package-lock.json
+
+# 凭据与日志
+.env
+*.log
+
+# Windows 临时
+Thumbs.db
+Desktop.ini
