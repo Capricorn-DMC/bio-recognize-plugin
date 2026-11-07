@@ -1,6 +1,10 @@
-window.__ModuleLoader__.load({
-  id: '@local/bio-recognize',
-  factory(require) {
+// ─── Dual-protocol client module loader ──────────────────────────────────
+// New DSH (>= 2026.x): window.__ModuleLoader__.load({ id, factory(require) })
+// Old DSH (V0.2.x):    module.exports = { inject, apply(ctx) }
+//   The factory body below runs once per protocol; it returns the module
+//   object { inject, apply } which each host consumes differently.
+(function () {
+  const mod = (require) => {
     const React = require('react');
     const h = React.createElement;
 
@@ -798,24 +802,85 @@ window.__ModuleLoader__.load({
         realCtx = ctx;
         const renderConfig = () => h(BioRecognizeConfig, null);
 
-        ctx.slots.inject('settings.section', () => ctx.slots.register({
-          name: 'settings.section',
-          id: 'bio-recognize',
-          order: 50,
-          label: '生物识别',
-        }, renderConfig));
+        // New protocol: ctx.slots.inject(name, cb) -> ctx.slots.register(...)
+        if (ctx.slots && ctx.slots.inject) {
+          ctx.slots.inject('settings.section', () => ctx.slots.register({
+            name: 'settings.section',
+            id: 'bio-recognize',
+            order: 50,
+            label: '生物识别',
+          }, renderConfig));
 
-        ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
-          name: 'plugins.bundle.config',
-          key: '@local/bio-recognize',
-        }, renderConfig));
+          ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
+            name: 'plugins.bundle.config',
+            key: '@local/bio-recognize',
+          }, renderConfig));
 
-        ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
-          name: 'conversation.composer.dock',
-          id: 'bio-recognize-status',
-          order: 10,
-        }, StatusPanel));
+          ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+            name: 'conversation.composer.dock',
+            id: 'bio-recognize-status',
+            order: 10,
+          }, StatusPanel));
+          return;
+        }
+
+        // Old DSH V0.2.x fallback: register slots directly (no .inject indirection).
+        // Guard every call so a missing host API degrades gracefully instead of
+        // throwing and blanking the settings page.
+        const safe = (fn, label) => {
+          try { fn(); } catch (e) {
+            console.warn('[bio-recognize] slot registration skipped (' + label + '):', e);
+          }
+        };
+        const slots = ctx.slots;
+        if (slots && slots.register) {
+          safe(() => slots.register({
+            name: 'settings.section',
+            id: 'bio-recognize',
+            order: 50,
+            label: '生物识别',
+          }, renderConfig), 'settings.section');
+
+          safe(() => slots.register({
+            name: 'plugins.bundle.config',
+            key: '@local/bio-recognize',
+          }, renderConfig), 'plugins.bundle.config');
+
+          safe(() => slots.register({
+            name: 'conversation.composer.dock',
+            id: 'bio-recognize-status',
+            order: 10,
+          }, StatusPanel), 'conversation.composer.dock');
+        }
       }
     };
+  };
+
+  // ── New DSH: __ModuleLoader__ (async factory with require) ──
+  if (typeof window !== 'undefined' && window.__ModuleLoader__ && window.__ModuleLoader__.load) {
+    window.__ModuleLoader__.load({
+      id: '@local/bio-recognize',
+      factory: (require) => mod(require),
+    });
+  } else if (typeof module !== 'undefined' && module.exports) {
+    // ── Old DSH V0.2.x: CommonJS module export ──
+    // require('react') is provided by the host's module system at load time.
+    module.exports = {
+      inject: ['slots', 'connection'],
+      apply(ctx) {
+        // Old host resolves 'react' through its own registry; bind lazily.
+        const r = (typeof require === 'function') ? require('react') : (window.React || null);
+        if (!r) {
+          console.error('[bio-recognize] React unavailable in old-DSH client context; skipping UI registration.');
+          return;
+        }
+        // Re-run the module factory with a require that returns the host React.
+        const boundRequire = (name) => (name === 'react' ? r : ((typeof require === 'function') ? require(name) : null));
+        const modOut = mod(boundRequire);
+        modOut.apply(ctx);
+      },
+    };
+  } else {
+    console.warn('[bio-recognize] No known client module protocol detected (__ModuleLoader__ or module.exports both absent).');
   }
-});
+})();
