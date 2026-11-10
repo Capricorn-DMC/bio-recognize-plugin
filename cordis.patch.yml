@@ -1,0 +1,4 @@
+- insert:
+    - id: bio-recognize
+      name: '@local/bio-recognize'
+      config: {}

@@ -1,0 +1,43 @@
+{
+  "name": "@local/bio-recognize",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Biometric presence detection (face): screen off when away, screen on when you return",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon/biometric.svg",
+    "./server": "./server.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "server.js",
+    "test_server.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon/biometric.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {},
+  "devDependencies": {},
+  "scripts": {
+    "start": "node server.js",
+    "start:port": "node server.js --port=8765",
+    "test": "node test_server.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-conversation"]
+    }
+  }
+}

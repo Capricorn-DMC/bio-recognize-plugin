@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <!-- Background circle -->
+  <circle cx="32" cy="32" r="30" fill="#1a1a2e"/>
+  
+  <!-- Face outline -->
+  <ellipse cx="32" cy="26" rx="14" ry="16" fill="none" stroke="#4ade80" stroke-width="2"/>
+  
+  <!-- Left eye -->
+  <ellipse cx="26" cy="22" rx="3" ry="2" fill="#4ade80"/>
+  <circle cx="26" cy="22" r="1" fill="#1a1a2e"/>
+  
+  <!-- Right eye -->
+  <ellipse cx="38" cy="22" rx="3" ry="2" fill="#4ade80"/>
+  <circle cx="38" cy="22" r="1" fill="#1a1a2e"/>
+  
+  <!-- Mouth -->
+  <path d="M 26 32 Q 32 36 38 32" fill="none" stroke="#4ade80" stroke-width="2" stroke-linecap="round"/>
+  
+  <!-- Voice waves -->
+  <path d="M 16 44 Q 20 40 24 44" fill="none" stroke="#60a5fa" stroke-width="1.5" stroke-linecap="round" opacity="0.8"/>
+  <path d="M 22 48 Q 28 42 34 48" fill="none" stroke="#60a5fa" stroke-width="1.5" stroke-linecap="round" opacity="0.6"/>
+  <path d="M 28 52 Q 36 44 44 52" fill="none" stroke="#60a5fa" stroke-width="1.5" stroke-linecap="round" opacity="0.4"/>
+  
+  <!-- Pupil/gaze indicator -->
+  <circle cx="32" cy="22" r="2" fill="none" stroke="#f59e0b" stroke-width="1" stroke-dasharray="2 2"/>
+  
+  <!-- Scan line effect -->
+  <line x1="18" y1="26" x2="46" y2="26" stroke="#4ade80" stroke-width="0.5" opacity="0.3"/>
+</svg>

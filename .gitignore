@@ -1,0 +1,15 @@
+# Runtime state & data (auto-created by server.js)
+.server.pid
+models/captures/
+models/server.log
+models/server.err.log
+models/users.json
+models/users.test-backup.json
+models/config.test-backup.json
+models/_black_level.txt
+models/_black_state.txt
+models/_cursor_handle.txt
+
+# OS junk
+Thumbs.db
+.DS_Store

@@ -1,0 +1,22 @@
+{
+  "enabled": true,
+  "faceEnabled": true,
+  "noCamMode": false,
+  "noCamIdleSec": 300,
+  "detectionInterval": 300,
+  "absentThreshold": 1,
+  "faceGraceMs": 450,
+  "awayDelayMs": 350,
+  "bioOnly": true,
+  "wakeHoldMs": 200,
+  "minBlackMs": 600,
+  "wakeGuardMs": 1500,
+  "manualOverrideMs": 3000,
+  "watchdogMs": 8000,
+  "identityCheck": true,
+  "matchThreshold": 0.65,
+  "matchThresholdV2": 0.93,
+  "lastSeen": null,
+  "isScreenBlack": false,
+  "learnFaces": true
+}
