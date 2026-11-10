@@ -15,22 +15,15 @@
 
 ## 安装
 
-```bash
-# 前置：Node.js >= 18
-cd bio-recognize-plugin
-npm install           # 无外部依赖，仅校验 manifest
-```
+前置：Node.js >= 18（本项目无第三方依赖，无需 `npm install`）。
 
-在 DSH 中安装（三选一）：
+在 DSH 中安装（二选一）：
 
 ```bash
 # 方式 1：CLI 源码安装（推荐，复制即可用）
 dsh plugin --profile web add github:Capricorn-DMC/bio-recognize-plugin
 
 # 方式 2：DSH 中插件管理 → 安装 → 选择本目录（本地开发）
-
-# 方式 3：npm 安装（如已发布 npm 包）
-# dsh plugin --profile web add @capricorn-dmc/bio-recognize
 ```
 
 ## 使用
