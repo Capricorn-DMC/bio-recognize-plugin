@@ -1728,6 +1728,14 @@ class BioRecognizeBackend {
             migrate: data.migrate || null,
             backend: data.backend || null,
             nocam: data.nocam === true,
+            // Loop health, straight from the browser: which clock drives the
+            // beats ('worker' = throttle-proof, 'timer' = throttled), whether
+            // the tab is hidden, and how many token holders keep it alive.
+            // Without these, "no heartbeat at all" is indistinguishable from
+            // "the tab was frozen" or "every component released".
+            clock: data.clock || null,
+            vis: data.vis || null,
+            tok: typeof data.tok === 'number' ? data.tok : null,
             at: now,
         };
         // Latch the "no camera device exists" statement: on while the client

@@ -101,6 +101,9 @@
       // That is exactly how the pill ended up stuck on "心跳中断" forever —
       // camera closed, timer cleared, and nothing left to re-acquire it.
       tokens: new Set(),
+      intent: false,       // user wants detection (config-driven, unmount-proof)
+      intentToken: null,   // the module-level token that expresses that intent
+      _idleStopTimer: null,// debounced teardown when the last token leaves
       stream: null,
       video: null,
       timer: null,
@@ -509,6 +512,7 @@
       acquire(intervalMs) {
         const token = { ms: Math.max(intervalMs || 500, 250) };
         this.tokens.add(token);
+        if (this._idleStopTimer) { clearTimeout(this._idleStopTimer); this._idleStopTimer = null; }
         this._applyInterval();
         if (!this.running) {
           this.running = true;
@@ -548,15 +552,53 @@
 
       release(token) {
         if (token && this.tokens.delete(token)) {
-          // fall through to interval/stop bookkeeping
+            // fall through to interval/stop bookkeeping
         } else if (!token) {
-          // Legacy call with no token: stop everything (old behaviour).
-          this.tokens.clear();
+            // Legacy call with no token: stop everything (old behaviour).
+            this.tokens.clear();
         } else {
-          return;   // unknown token: never punish the other consumers
+            return;   // unknown token: never punish the other consumers
         }
-        if (this.tokens.size === 0) this._stop();
-        else this._applyInterval();
+        if (this.tokens.size) { this._applyInterval(); return; }
+        // The intent still stands: config says "detect", so the token that just
+        // left belonged to a COMPONENT, not to the user's decision. Keep going.
+        if (this.intent) return;
+        // Debounce the teardown: a remount, an HMR reload, or ONE failed
+        // /presence poll (which flips status.online to false and releases)
+        // must not stop the camera.
+        if (this._idleStopTimer) clearTimeout(this._idleStopTimer);
+        this._idleStopTimer = setTimeout(() => {
+            this._idleStopTimer = null;
+            if (!this.tokens.size && !this.intent) this._stop();
+        }, 8000);
+      },
+
+      // ── User intent (module-level, survives every unmount) ─────────────
+      // Presence detection used to live ENTIRELY in React effects. Closing the
+      // settings page, a re-render, or a single timed-out /presence poll drove
+      // the token count to zero, which called _stop(): camera released, beat
+      // timer cleared, running=false. The UI still showed "检测中" because it
+      // reads the SERVER, while the browser sent nothing at all. Field
+      // evidence: 204s of heartbeat silence, camera idle at the OS level,
+      // nothing reacting to a face — and the server was perfectly healthy.
+      //
+      // Whether the plugin works must not depend on which React component
+      // happens to be mounted. Intent is set from config and is only cleared
+      // when the user actually turns detection off.
+      setIntent(on) {
+        const next = !!on;
+        if (next === this.intent) return;
+        this.intent = next;
+        if (next) {
+          if (!this.intentToken) this.intentToken = this.acquire(300);
+        } else if (this.intentToken) {
+          const t = this.intentToken;
+          this.intentToken = null;
+          if (this._idleStopTimer) { clearTimeout(this._idleStopTimer); this._idleStopTimer = null; }
+          this.tokens.delete(t);
+          if (this.tokens.size) this._applyInterval();
+          else this._stop();
+        }
       },
 
       _applyInterval() {
@@ -599,7 +641,7 @@
           this.beatWorker = w;
           // Visible marker so it is obvious from DevTools which build is live
           // (dsh serves the client bundle from memory captured at startup).
-          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261110f)');
+          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261110g)');
         } catch {
           // Worker construction blocked (strict CSP etc.) — old behaviour.
           this.timer = setInterval(() => this._send(), this.intervalMs);
@@ -795,6 +837,11 @@
           }
         }
         const body = { cam: this.diag.cam, det: this.picoReady ? 'ok' : 'missing' };
+        // Loop health: without this, "no beats arrived" is indistinguishable
+        // between a frozen tab, a throttled timer and a released token.
+        body.clock = this.beatWorker ? 'worker' : (this.timer ? 'timer' : 'none');
+        body.vis = document.hidden ? 'hidden' : 'visible';
+        body.tok = this.tokens.size;
         // Tell the server this machine has NO camera device at all — the only
         // statement that may engage its input-idle fallback mode.
         if (this.noCam) body.nocam = true;
@@ -1163,8 +1210,13 @@
       const online = service.running === true;
 
       // ── Presence heartbeat via camera (HeartbeatMgr singleton) ──
-      // The status panel keeps heartbeats running even with this page closed;
-      // acquiring here only bumps the refcount / applies the configured interval.
+      // Intent is CONFIG-DRIVEN: with detection enabled it holds a module-level
+      // token, so closing this page or one failed poll can no longer shut the
+      // camera down (see HeartbeatMgr.setIntent).
+      React.useEffect(() => {
+        HeartbeatMgr.setIntent(!!(config.enabled && config.faceEnabled));
+      }, [config.enabled, config.faceEnabled]);
+
       React.useEffect(() => {
         const shouldRun = !!(online && config.enabled && config.faceEnabled);
         // Must NOT return a cleanup when nothing was acquired: the cleanup runs
@@ -1487,10 +1539,12 @@
       React.useEffect(() => {
         let disposed = false;
         let backoff = 500;
+        let misses = 0;      // consecutive failed polls
         const tick = async () => {
           try {
             const d = await fetchJson(`${BACKEND_URL}/presence`, {}, 3000);
             const online = d.status === 'active' || d.status === 'inactive';
+            misses = 0;
             setStatus({
               online,
               enabled: online && d.status === 'active',
@@ -1510,7 +1564,11 @@
             // backend restart the pill (and the camera) must come back
             // quickly instead of waiting out a 15s backoff.
             backoff = Math.min(backoff * 2, 3000);
-            setStatus(p => ({ ...p, online: false }));
+            // ONE timed-out loopback call used to mean "offline": the panel
+            // released its token and the camera stopped dead. A single miss on
+            // a 500ms poll is noise — require three in a row to call it a real
+            // outage (and intent now keeps the loop alive regardless).
+            if (++misses >= 3) setStatus(p => ({ ...p, online: false }));
           }
           if (!disposed) pollRef.current = window.setTimeout(tick, backoff);
         };
@@ -1523,6 +1581,10 @@
         // face-loss tolerance, otherwise "user left" is detected late and
         // feels slower than "user came back".
         const shouldRun = !!(status.online && status.enabled);
+        // The panel can also arm detection on its own: if the settings page was
+        // never opened (or was just closed), this is the only consumer, and a
+        // single failed poll used to leave nobody holding the camera at all.
+        if (shouldRun) HeartbeatMgr.setIntent(true);
         if (!shouldRun) return undefined;
         const token = HeartbeatMgr.acquire(300);
         return () => HeartbeatMgr.release(token);
