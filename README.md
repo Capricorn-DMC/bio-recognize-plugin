@@ -36,7 +36,7 @@ npm install           # 无外部依赖，仅校验 manifest
 1. 打开 DSH **设置 → 智能熄屏**
 2. 点「▶ 启动服务」（插件激活时通常已自动启动）
 3. 添加用户 → 用「📷 摄像头采集」录入人脸（无摄像头时用路径录入）
-4. 配置「离开后动作」（黑屏 / 锁屏）与时间参数
+4. 配置熄屏时间等参数（离开后动作固定为黑屏，不支持锁屏）
 5. 「💾 保存配置」并启用检测
 
 Agent 侧工具（聊天中直接让 AI 调用）：
@@ -46,7 +46,7 @@ Agent 侧工具（聊天中直接让 AI 调用）：
 | `biometric_service_control` | 启动 / 停止 / 查询后端服务 |
 | `biometric_register_face(_photo)` | 路径或 base64 录入人脸 |
 | `biometric_face_detect` | 单模态人脸检测 |
-| `biometric_screen_control` | 亮屏 / 黑屏 / 锁屏 / 解锁 |
+| `biometric_screen_control` | 亮屏 / 黑屏 / 查询状态 |
 | `biometric_set_config` / `biometric_get_config` | 读写配置 |
 | `biometric_presence_status` | 在场状态 |
 | `biometric_manage_users` | 用户增删查 |
@@ -73,8 +73,7 @@ bio-recognize-plugin/
 
 ## 安全注意
 
-- `models/config.json` 中的锁屏密码**明文存储**，请保护好该目录权限
-- 自动解锁通过 PowerShell 模拟键盘输入密码，仅适用于本机可信环境
+- 熄屏仅是黑屏覆盖 + 降亮度，**不涉及 Windows 会话锁**，也不存储任何密码
 - 无摄像头降级模式**没有身份安全**（任何人动键鼠都能亮屏），仅作节能用途
 - 建议仅在内网/本机部署
 

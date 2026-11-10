@@ -1,9 +1,9 @@
 /**
- * BioRecognize DSH Plugin - Face Biometric Recognition & Smart Lock Screen
+ * BioRecognize DSH Plugin - Face Biometric Recognition & Smart Screen Off
  *
  * Features:
  * - Face registration (overwrite allowed) with CNN identity matching
- * - Smart screen control with auto-unlock via password
+ * - Smart screen control: black screen when away, wake when the owner returns
  */
 
 import http from 'http';
@@ -424,25 +424,21 @@ export function apply(ctx, config) {
 
   ctx.tools.register({
     name: 'biometric_screen_control',
-    description: 'Control screen state: on, off (black), lock, or unlock. When locked, can auto-unlock with configured password via keyboard simulation.',
+    description: 'Control screen state: on (wake) or off (black). Lock screen is not supported — this plugin only blacks the display and never touches the Windows session.',
     parameters: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['on', 'off', 'lock', 'unlock', 'state'],
-          description: 'Screen action: on=唤醒, off=黑屏, lock=锁屏, unlock=解锁, state=查询状态'
-        },
-        password: {
-          type: 'string',
-          description: 'Password for unlock (optional if configured in plugin settings)'
+          enum: ['on', 'off', 'state'],
+          description: 'Screen action: on=亮屏, off=黑屏, state=查询状态'
         }
       },
       required: ['action']
     },
-    output: { schema: { type: 'object', properties: { success: { type: 'boolean' }, isLocked: { type: 'boolean' }, isBlack: { type: 'boolean' }, message: { type: 'string' } } }, render: renderJson },
+    output: { schema: { type: 'object', properties: { success: { type: 'boolean' }, isBlack: { type: 'boolean' }, message: { type: 'string' } } }, render: renderJson },
     async execute(args) {
-      return await callBackend('/screen', { action: args.action, password: args.password }, pluginConfig);
+      return await callBackend('/screen', { action: args.action }, pluginConfig);
     }
   });
 
@@ -452,14 +448,12 @@ export function apply(ctx, config) {
 
   ctx.tools.register({
     name: 'biometric_set_config',
-    description: 'Configure plugin settings: enable/disable detection, set lock mode, configure password for auto-unlock.',
+    description: 'Configure plugin settings: enable/disable detection, time thresholds, identity thresholds.',
     parameters: {
       type: 'object',
       properties: {
         enabled: { type: 'boolean', description: 'Enable presence detection' },
         faceEnabled: { type: 'boolean', description: 'Enable face detection' },
-        lockMode: { type: 'string', enum: ['black', 'lock'], description: 'Action when absent: black screen or lock screen' },
-        lockPassword: { type: 'string', description: 'Windows password for auto-unlock when user returns' },
         absentThreshold: { type: 'integer', description: 'Seconds before acting when user absent (default: 30)' },
         detectionInterval: { type: 'integer', description: 'Detection check interval in ms (default: 5000)' }
       }

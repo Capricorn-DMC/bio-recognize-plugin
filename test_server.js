@@ -71,31 +71,25 @@ async function test() {
   const updateConfig = await request('POST', '/config', {
     enabled: true,
     faceEnabled: true,
-    lockMode: 'lock',
     absentThreshold: 30,
     detectionInterval: 5000
   });
   console.log('  Config updated:', updateConfig.data.status);
 
-  // Test 6: Screen Control - Lock
-  console.log('\n[Test 6] Screen Lock');
-  const lockScreen = await request('POST', '/screen', { action: 'lock' });
-  console.log('  Locked:', lockScreen.data.isLocked);
-
-  // Test 7: Screen Control - Turn On
-  console.log('\n[Test 7] Screen On');
+  // Test 6: Screen Control - Turn On
+  console.log('\n[Test 6] Screen On');
   const turnOn = await request('POST', '/screen', { action: 'on' });
-  console.log('  Turned on:', !turnOn.data.isLocked && !turnOn.data.isBlack);
+  console.log('  Turned on:', !turnOn.data.isBlack);
 
-  // Test 8: Screen Control - Black
-  console.log('\n[Test 8] Screen Black');
+  // Test 7: Screen Control - Black
+  console.log('\n[Test 7] Screen Black');
   const blackScreen = await request('POST', '/screen', { action: 'off' });
   console.log('  Black:', blackScreen.data.isBlack);
 
-  // Test 11: Screen Control - Turn On again
-  console.log('\n[Test 11] Screen On Again');
+  // Test 8: Screen Control - Turn On again
+  console.log('\n[Test 8] Screen On Again');
   const turnOn2 = await request('POST', '/screen', { action: 'on' });
-  console.log('  Turned on:', !turnOn2.data.isLocked && !turnOn2.data.isBlack);
+  console.log('  Turned on:', !turnOn2.data.isBlack);
 
   // Test 12: Presence Status
   console.log('\n[Test 12] Presence Status');
