@@ -104,16 +104,30 @@ let config = {
     awayDelayMs: 350,      // extra confirmation after last provable presence
     // ── Biometric-only gating ──────────────────────────────────────────
     // bioOnly: presence is decided ONLY by the face biometric signal.
-    // Keyboard & mouse never keep the screen on and
-    // never wake it — that is what makes "only I can wake my screen" work.
-    // Input is still used for one thing only: a deliberate escape hatch
-    // (sustained typing/mouse for manualOverrideMs) so a camera failure can
-    // never trap the user behind a black screen.
+    // Keyboard & mouse never keep the screen on and never wake it — that is
+    // what makes "only I can wake my screen" work. Nothing in this file may
+    // bypass that rule (the old manual-override path did, and it was the
+    // reason a mouse move could light the display again); the sole exception
+    // is a long Shift/Esc hold, which is a deliberate act, not incidental
+    // input.
     bioOnly: true,
     wakeHoldMs: 200,       // presence must hold this long before waking
     minBlackMs: 600,       // minimum time black before a wake is allowed
     wakeGuardMs: 1500,     // after a wake, ignore absence for this long
-    manualOverrideMs: 3000,// sustained input while black → forced wake
+    // ── Escape hatch (KEYBOARD ONLY) ───────────────────────────────────
+    // bioOnly means a mouse move can never wake the screen. That used to be
+    // true for presence but NOT for the old manualOverrideMs path, which
+    // fired on any sustained input — so wiggling the mouse for 3s lit the
+    // panel back up (and even woke it for a stranger). Input is no longer
+    // part of the wake rule at all; the only way out of a black screen
+    // without a recognised face is holding Shift or Esc down for this long.
+    // Read from the OS key state (GetAsyncKeyState), so it works no matter
+    // which window has focus — including the full-screen black overlay.
+    keyEscapeMs: 8000,     // hold Shift / Esc this long while black → forced wake
+    escapeVerifyMs: 5000,  // after a forced wake: no recognised face in this
+                           // window → black out again (a stranger cannot keep
+                           // the screen alive with the keyboard either)
+    wakeStreakFrames: 2,   // consecutive face frames required before waking
     watchdogMs: 8000,      // no client heartbeat for this long → stand down
     // ── Identity (1:N face matching) ───────────────────────────────────
     // identityCheck: a detected face only counts if it matches an enrolled
@@ -372,6 +386,11 @@ class InputMonitor {
         this.backoff = 1000;
         this.stopped = false;
         this.buffer = '';
+        // Physical key state, polled from the OS rather than from the web page:
+        // the black overlay is a different window, so key events never reach
+        // the browser. GetAsyncKeyState is global — focus does not matter.
+        this.shiftDown = false;
+        this.escDown = false;
     }
 
     start() {
@@ -389,6 +408,12 @@ class InputMonitor {
         return this.idleSeconds;
     }
 
+    // True while the escape-hatch key is physically held. Deliberately only
+    // Shift / Esc: a key that is never typed by accident for 8 seconds.
+    isEscapeHeld() {
+        return !!(this.shiftDown || this.escDown);
+    }
+
     _spawn() {
         if (this.stopped) return;
         try {
@@ -401,6 +426,8 @@ public class LastInput {
     public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
     [DllImport("user32.dll")]
     public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+    [DllImport("user32.dll")]
+    public static extern short GetAsyncKeyState(int vKey);
 }
 "@
 while ($true) {
@@ -408,7 +435,11 @@ while ($true) {
     $lii.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($lii)
     [void][LastInput]::GetLastInputInfo([ref]$lii)
     $idle = [uint32]([Environment]::TickCount - $lii.dwTime)
-    Write-Output $idle
+    $shift = 0
+    if (([LastInput]::GetAsyncKeyState(0x10) -band 0x8000) -ne 0) { $shift = 1 }
+    $esc = 0
+    if (([LastInput]::GetAsyncKeyState(0x1B) -band 0x8000) -ne 0) { $esc = 1 }
+    Write-Output "$idle $shift $esc"
     Start-Sleep -Milliseconds 400
 }
 `;
@@ -420,10 +451,13 @@ while ($true) {
                 while ((idx = this.buffer.indexOf('\n')) >= 0) {
                     const line = this.buffer.slice(0, idx).trim();
                     this.buffer = this.buffer.slice(idx + 1);
-                    const ms = parseInt(line, 10);
+                    const parts = line.split(/\s+/);
+                    const ms = parseInt(parts[0], 10);
                     if (!isNaN(ms)) {
                         this.idleSeconds = ms / 1000;
                         this.lastUpdate = Date.now();
+                        this.shiftDown = parts[1] === '1';
+                        this.escDown = parts[2] === '1';
                     }
                 }
             });
@@ -433,6 +467,8 @@ while ($true) {
             });
             this.proc.on('exit', () => {
                 this.proc = null;
+                this.shiftDown = false;
+                this.escDown = false;
                 if (!this.stopped) {
                     // auto-restart with backoff so the sensor never stays dead
                     setTimeout(() => { if (!this.stopped) this._spawn(); }, this.backoff);
@@ -440,7 +476,7 @@ while ($true) {
                 }
             });
             this.proc.on('error', () => { try { this.proc.kill(); } catch { /* noop */ } });
-            console.log('[InputMonitor] started (poll: 400ms)');
+            console.log('[InputMonitor] started (poll: 400ms, escape keys: Shift/Esc)');
         } catch (e) {
             console.error('[InputMonitor] spawn failed:', e.message);
             setTimeout(() => { if (!this.stopped) this._spawn(); }, this.backoff);
@@ -838,7 +874,9 @@ class PresenceEngine {
         // screen black→on→black in an endless loop.
         this.presentSince = null;      // start of the current continuous presence streak
         this.absentStreakStart = null; // start of the current continuous absence streak
-        this.inputActiveSince = null;  // sustained-input escape-hatch timer
+        this.keyHeldSince = null;      // since when Shift/Esc has been held (escape hatch)
+        this.faceStreak = 0;           // consecutive heartbeats carrying >=1 face
+        this.escapeDeadline = 0;       // when an escape-woken screen gets re-verified
         this.reason = null;            // why the last state change happened (diagnostics)
 
         this.keepAlive = new KeepAlive();
@@ -894,7 +932,7 @@ class PresenceEngine {
             this.state = 'unknown';
             this.presentSince = null;
             this.absentStreakStart = null;
-            this.inputActiveSince = null;
+            this.keyHeldSince = null;
             // Only hand the screen back after a real loss (watchdog), not for a
             // sub-second gap that will heal itself.
             if (this.screen.isBlack && hbAge > watchdogMs) {
@@ -940,7 +978,7 @@ class PresenceEngine {
             this.state = 'unknown';
             this.presentSince = null;
             this.absentStreakStart = null;
-            this.inputActiveSince = null;
+            this.keyHeldSince = null;
             if (this.screen.isBlack) {
                 console.log('[Presence] Camera/detector unavailable — restoring screen');
                 await this.screen.turnOn();
@@ -994,8 +1032,18 @@ class PresenceEngine {
         this.idRequired = idRequired;
         this.idFresh = idFresh;
 
+        // A face may only wake the screen if it was seen AFTER the panel went
+        // black, and if it has lasted several consecutive frames. The frame
+        // that was still in flight when the screen blanked used to satisfy the
+        // 600ms black floor alone and re-light the display ~0.6s later — the
+        // "goes black, then bright again" flicker. While the screen is ON none
+        // of this applies: the normal absence path handles an empty desk.
+        const wakeStreakNeeded = Math.min(Math.max(parseInt(cfg.wakeStreakFrames, 10) || 2, 1), 5);
+        const faceAfterBlack = !this.screen.isBlack ||
+            (!!this.faceSeenAt && !!this.screen.blackSince && this.faceSeenAt > this.screen.blackSince);
+        const streakOk = !this.screen.isBlack || this.faceStreak >= wakeStreakNeeded;
         const faceHit = faceUsable && this.faceSeenAt && (now - this.faceSeenAt) < faceGrace &&
-            (!idRequired || idFresh);
+            faceAfterBlack && streakOk && (!idRequired || idFresh);
         const bioHit = !!faceHit;
 
         // ── 1.5 "Unsure" identity ────────────────────────────────────
@@ -1044,6 +1092,28 @@ class PresenceEngine {
         const wakeHoldMs = Math.min(Math.max(cfg.wakeHoldMs || 250, 100), 3000);
         const minBlackMs = Math.min(Math.max(cfg.minBlackMs || 700, 0), 5000);
 
+        // ── 3.5 Verification of a forced wake ────────────────────────
+        // The escape hatch turns the panel on without proving anyone is the
+        // owner. It is a temporary view, not a presence claim: if the camera
+        // does not recognise an enrolled face within escapeVerifyMs, the
+        // screen goes back to black. Without this, "hold Shift for 8s" would
+        // be a permanent bypass — anybody could keep the display alive.
+        if (this.escapeDeadline) {
+            if (bioHit) {
+                this.escapeDeadline = 0;      // owner showed up — normal rules apply
+            } else if (now >= this.escapeDeadline && !this.screen.isBlack) {
+                this.escapeDeadline = 0;
+                console.log('[Screen] Forced wake not verified — blacking out again');
+                await this.screen.turnOff();
+                cfg.isScreenBlack = true;
+                this.reason = 'escape-unverified';
+                this.actionTaken = true;
+                this.absentStreakStart = now;
+                this.presentSince = null;
+                return;
+            }
+        }
+
         if (present) {
             if (this.presentSince == null) {
                 this.presentSince = now;
@@ -1053,7 +1123,7 @@ class PresenceEngine {
             this.absentStreakStart = null;
             this.absentSince = null;
             this.actionTaken = false;   // re-arm the away action
-            this.inputActiveSince = null;
+            this.keyHeldSince = null;
             this.state = 'present';
 
             const heldMs = now - this.presentSince;
@@ -1120,25 +1190,42 @@ class PresenceEngine {
 
             const absentMs = now - this.absentStreakStart;
 
-            // Escape hatch: a DELIBERATE amount of input while black wakes the
-            // screen (manualOverrideMs of continuous typing/mouse). A single
-            // mouse move still does nothing — that is the point — but a dead
-            // camera or a changed haircut can never trap the user.
-            if (this.screen.isBlack && inputHit && (cfg.manualOverrideMs || 3000) > 0) {
-                if (this.inputActiveSince == null) this.inputActiveSince = now;
-                else if (now - this.inputActiveSince >= (cfg.manualOverrideMs || 3000)) {
-                    console.log('[Screen] Manual override — sustained input while black, restoring');
-                    this.inputActiveSince = null;
-                    await this.screen.turnOn();
-                    cfg.isScreenBlack = false;
-                    this.reason = 'manual-override';
-                    // Reset the streak so we do not immediately blank again.
-                    this.absentStreakStart = now;
-                    this.actionTaken = false;
-                    return;
+            // ── Escape hatch: KEYBOARD ONLY ─────────────────────────────
+            // Wiggling the mouse must never wake the screen. That is the one
+            // promise bioOnly makes, and the previous build broke it: this
+            // block fired on `inputHit` (any OS input) after 3s, so moving the
+            // mouse kept lighting the panel back up — and, because it ignored
+            // identity entirely, it also did so for a stranger.
+            //
+            // What is left is a deliberate act: hold Shift or Esc down for
+            // keyEscapeMs. The state comes from GetAsyncKeyState, so the black
+            // overlay swallowing the keyboard does not matter, and no amount
+            // of ordinary typing/mousing can ever reach this branch.
+            if (this.screen.isBlack) {
+                const escapeMs = Math.min(Math.max(parseInt(cfg.keyEscapeMs, 10) || 0, 0), 60000);
+                if (escapeMs > 0 && this.input.isEscapeHeld()) {
+                    if (this.keyHeldSince == null) {
+                        this.keyHeldSince = now;
+                        console.log('[Screen] Escape key held — keep holding to force a wake');
+                    } else if (now - this.keyHeldSince >= escapeMs) {
+                        console.log(`[Screen] Escape key held ${Math.round(now - this.keyHeldSince)}ms — forced wake`);
+                        this.keyHeldSince = null;
+                        await this.screen.turnOn();
+                        cfg.isScreenBlack = false;
+                        this.reason = 'key-escape';
+                        // Bounded trust: the panel is on, but nobody has proven
+                        // they are the owner. escapeVerifyMs later the engine
+                        // checks again and blacks out if no match showed up.
+                        this.escapeDeadline = now + Math.min(Math.max(parseInt(cfg.escapeVerifyMs, 10) || 5000, 1000), 15000);
+                        this.absentStreakStart = now;
+                        this.actionTaken = false;
+                        return;
+                    }
+                } else {
+                    this.keyHeldSince = null;
                 }
             } else {
-                this.inputActiveSince = null;
+                this.keyHeldSince = null;
             }
 
             // Absence must be OBSERVED continuously for awayDelayMs. Using a
@@ -1166,6 +1253,11 @@ class PresenceEngine {
         await this.screen.turnOff();
         cfg.isScreenBlack = true;
         this.reason = 'absent';
+        // Fresh wake evidence only: face frames from BEFORE this blackout must
+        // not be able to light the panel again 600ms later.
+        this.faceStreak = 0;
+        this.keyHeldSince = null;
+        this.escapeDeadline = 0;
     }
 }
 
@@ -1292,6 +1384,10 @@ class BioRecognizeBackend {
                 // panel is off while it is actually on (and vice versa).
                 delete data.isScreenBlack;
                 delete data.lastSeen;
+                // Retired rule: input-driven wake (any mouse move for 3s could
+                // light the display). Dropped from disk so an old config can
+                // never resurrect it.
+                delete data.manualOverrideMs;
                 Object.assign(config, data);
                 // Not user-facing any more: with face recognition enabled the
                 // plugin always judges by biometrics only (keyboard/mouse can
@@ -1394,6 +1490,7 @@ class BioRecognizeBackend {
             this.presence.absentSince = null;
             this.presence.faceSeenAt = null;
             this.presence.lastNumericFaceAt = null;
+            this.presence.faceStreak = 0;
             this.presence.actionTaken = false;
             if (beatGap > 3000) {
                 console.log(`[Presence] Heartbeat resumed after ${Math.round(beatGap)}ms — settling`);
@@ -1441,7 +1538,15 @@ class BioRecognizeBackend {
         // "no face here".
         if (typeof data.faces === 'number') {
             this.presence.lastNumericFaceAt = now;
-            if (data.faces >= 1) this.presence.faceSeenAt = now;
+            if (data.faces >= 1) {
+                this.presence.faceSeenAt = now;
+                // Consecutive frames, not a single lucky detection: one frame
+                // was enough to satisfy "a face is here" and re-light a screen
+                // that had just gone black.
+                this.presence.faceStreak = (this.presence.faceStreak || 0) + 1;
+            } else {
+                this.presence.faceStreak = 0;
+            }
         }
 
         // Live face descriptor(s) (computed by the client with the same
@@ -1567,14 +1672,19 @@ class BioRecognizeBackend {
         if (data.matchThreshold !== undefined) config.matchThreshold = Math.min(Math.max(parseFloat(data.matchThreshold) || 0.65, 0.3), 0.95);
         if (data.matchThresholdV2 !== undefined) config.matchThresholdV2 = Math.min(Math.max(parseFloat(data.matchThresholdV2) || THRESH_V2_DEFAULT, 0.60), 0.98);
         if (data.learnFaces !== undefined) config.learnFaces = !!data.learnFaces;
-        if (data.manualOverrideMs !== undefined) config.manualOverrideMs = Math.min(Math.max(parseInt(data.manualOverrideMs, 10) || 3000, 0), 20000);
+        // Mouse/keyboard can never wake the screen any more; 0 disables even
+        // the Shift/Esc escape hatch.
+        if (data.keyEscapeMs !== undefined) config.keyEscapeMs = Math.min(Math.max(parseInt(data.keyEscapeMs, 10) || 0, 0), 60000);
+        if (data.escapeVerifyMs !== undefined) config.escapeVerifyMs = Math.min(Math.max(parseInt(data.escapeVerifyMs, 10) || 5000, 1000), 15000);
+        if (data.wakeStreakFrames !== undefined) config.wakeStreakFrames = Math.min(Math.max(parseInt(data.wakeStreakFrames, 10) || 2, 1), 5);
 
         // Any judgement-rule change starts from a clean slate — stale streaks
         // from the previous rule would otherwise fire an action immediately.
         this.presence.presentSince = null;
         this.presence.absentStreakStart = null;
         this.presence.absentSince = null;
-        this.presence.inputActiveSince = null;
+        this.presence.keyHeldSince = null;
+        this.presence.escapeDeadline = 0;
         this.presence.actionTaken = false;
         
         this._saveConfig();

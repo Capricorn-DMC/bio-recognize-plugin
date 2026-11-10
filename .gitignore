@@ -9,6 +9,8 @@ models/config.test-backup.json
 models/_black_level.txt
 models/_black_state.txt
 models/_cursor_handle.txt
+models/_server.out
+models/_server.err
 
 # OS junk
 Thumbs.db

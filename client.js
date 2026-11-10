@@ -569,7 +569,7 @@
           this.beatWorker = w;
           // Visible marker so it is obvious from DevTools which build is live
           // (dsh serves the client bundle from memory captured at startup).
-          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261110c)');
+          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261110d)');
         } catch {
           // Worker construction blocked (strict CSP etc.) — old behaviour.
           this.timer = setInterval(() => this._send(), this.intervalMs);
@@ -1218,14 +1218,14 @@
               onChange: e => upd('matchThreshold', Math.min(Math.max(parseInt(e.target.value) || 65, 30), 95) / 100),
               min: 30, max: 95, step: 1, style: s.inputSmall,
             }),
-            h('span', { style: { fontSize: 12, color: T.text2 } }, '%，越大越严格（认不出时可用 3 秒键鼠强制亮屏）')
+            h('span', { style: { fontSize: 12, color: T.text2 } }, '%，越大越严格（人脸连续认不出时，可长按 Shift 或 Esc 8 秒强制亮屏）')
           ),
           h('div', { style: s.modalityCard },
             h('span', { style: { fontSize: 16 } }, '🌑'),
             h('div', { style: { flex: 1 } },
               h('div', { style: { fontSize: 13, fontWeight: 500, color: T.text } }, '黑屏模式'),
               h('div', { style: { fontSize: 11, color: T.text2, marginTop: 2, lineHeight: 1.5 } },
-                '只认人脸生物特征：命中即保持亮屏、命中即亮屏；消失并持续"离场确认"后熄屏。键鼠完全无权唤醒。人脸须与已登记本人匹配（1:N 特征比对）。')
+                '只认人脸生物特征：命中即保持亮屏、命中即亮屏；消失并持续"离场确认"后熄屏。移动鼠标 / 敲键盘完全无权唤醒，熄灭时长按 Shift 或 Esc 8 秒是唯一的人工应急（且 5 秒内认不出本人会重新熄灭）。人脸须与已登记本人匹配（1:N 特征比对）。')
             )
           ),
           h('div', { style: s.divider }),
