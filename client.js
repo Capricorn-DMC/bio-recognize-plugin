@@ -145,12 +145,26 @@
       migrating: false,
       migrated: false,
 
+      // Load a first-party script served by the local backend via a <script>
+      // tag (same mechanism as face-api.js below). Classic script evaluation
+      // keeps globals on `window` without any dynamic-code eval pattern.
+      _loadBackendScript(path) {
+        return new Promise((resolve, reject) => {
+          const el = document.createElement('script');
+          el.src = `${BACKEND_URL}${path}`;
+          el.async = true;
+          el.onload = () => resolve();
+          el.onerror = () => reject(new Error(`${path} load failed`));
+          document.head.appendChild(el);
+        });
+      },
+
       async _loadFaceDetector() {
         if (this.picoReady || this.picoLoading) return;
         this.picoLoading = true;
         try {
-          const src = await (await fetch(`${BACKEND_URL}/pico.js`)).text();
-          const pico = new Function(`${src}; return pico;`)();
+          await this._loadBackendScript('/pico.js');
+          const pico = window.pico;
           const buf = await (await fetch(`${BACKEND_URL}/facefinder`)).arrayBuffer();
           this.classifyRegion = pico.unpack_cascade(new Int8Array(buf));
           this.pico = pico;
@@ -165,8 +179,8 @@
         // Identity descriptor: SAME file the server uses, so the vectors it
         // computes here are directly comparable with the enrolled ones.
         try {
-          const src = await (await fetch(`${BACKEND_URL}/facedesc.js`)).text();
-          this.faceDesc = new Function(`${src}; return faceDescriptor;`)();
+          await this._loadBackendScript('/facedesc.js');
+          this.faceDesc = window.faceDescriptor;
         } catch (e) {
           console.warn('[Heartbeat] face descriptor unavailable:', e?.message);
         }

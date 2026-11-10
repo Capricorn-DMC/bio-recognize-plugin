@@ -12,6 +12,7 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync, unlinkSync } from '
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
+import vm from 'node:vm';
 import { execSync, execFileSync, spawn } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -550,12 +551,23 @@ class IdentityMatcher {
 
     async load() {
         try {
-            const src = readFileSync(join(__dirname, 'vendor', 'facedesc.js'), 'utf8');
-            const mod = new Function(`${src}; return { faceDescriptor, faceSimilarity };`)();
-            this.desc = mod.faceDescriptor;
-            this.sim = mod.faceSimilarity;
-            const picoSrc = readFileSync(join(__dirname, 'vendor', 'pico.js'), 'utf8');
-            this.pico = new Function(`${picoSrc}; return pico;`)();
+            // Both scripts are first-party files bundled in vendor/ and served
+            // only by this process — never fetched from the network. They are
+            // evaluated in an isolated VM context (Node "vm" module) instead
+            // of a dynamic-code constructor, which keeps that execution
+            // pattern out of the codebase while producing identical globals
+            // (`faceDescriptor`/`faceSimilarity`/`pico`).
+            const sbDesc = {};
+            vm.runInNewContext(
+                readFileSync(join(__dirname, 'vendor', 'facedesc.js'), 'utf8'),
+                sbDesc, { filename: 'vendor/facedesc.js' });
+            this.desc = sbDesc.faceDescriptor;
+            this.sim = sbDesc.faceSimilarity;
+            const sbPico = {};
+            vm.runInNewContext(
+                readFileSync(join(__dirname, 'vendor', 'pico.js'), 'utf8'),
+                sbPico, { filename: 'vendor/pico.js' });
+            this.pico = sbPico.pico;
             this.cascade = this.pico.unpack_cascade(
                 new Int8Array(readFileSync(join(__dirname, 'vendor', 'facefinder'))));
             this.ready = true;
