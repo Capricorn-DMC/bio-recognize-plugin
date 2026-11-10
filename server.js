@@ -982,7 +982,15 @@ class PresenceEngine {
         const idAvailable = !!(id && id.ready && id.refs.length && id.supported &&
             id.lastAt && (now - id.lastAt) < 5000);
         const idRequired = (cfg.identityCheck !== false) && idAvailable;
-        const idFresh = !!(id && id.matched && id.lastAt && (now - id.lastAt) < 2000);
+        // Identity freshness scales with the OBSERVED beat cadence. A fixed 2s
+        // window assumed ~350ms beats; a background-throttled tab (1-3s beats)
+        // then saw "match expired" on every slow beat and blacked the screen
+        // for one beat before the next one woke it again. The client already
+        // decouples inference from the beat, so this is only a safety margin
+        // for genuinely slow clocks — a stranger is still caught by the next
+        // embedding that arrives, which flips the verdict to 'other'.
+        const idWindow = Math.min(Math.max(2000, hbInterval * 2.5), 6000);
+        const idFresh = !!(id && id.matched && id.lastAt && (now - id.lastAt) < idWindow);
         this.idRequired = idRequired;
         this.idFresh = idFresh;
 

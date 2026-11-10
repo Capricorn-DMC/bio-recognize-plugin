@@ -142,6 +142,8 @@
       embIntervalMs: 1200,
       lastEmbAt: 0,
       lastEmbVec: null,
+      embBusy: false,      // an inference is running in the background
+      lastFaceCount: 0,    // previous beat's face count (detects "face appeared")
       migrating: false,
       migrated: false,
 
@@ -293,13 +295,25 @@
       // Compute the 128-D embedding of the largest face(s) currently visible.
       // Runs at most once per embIntervalMs; between runs the previous vector
       // is reused (valid for 1.5s), which keeps the heartbeat cadence intact.
-      async _embedV2() {
+      // Kick an embedding WITHOUT waiting for it. The heartbeat must never be
+      // blocked by inference: in a hidden tab one inference can take 2-3s,
+      // and awaiting it stretched the beat cadence past the server's identity
+      // freshness window — which read as "user left" and blacked the screen,
+      // then the next late beat said "present" again (the flicker loop).
+      // `force` bypasses the rate limit when a face has just re-appeared, so
+      // returning to the seat does not wait out the 1.2s interval.
+      _pumpEmbed(force) {
+        if (this.embBusy) return;
         const now = performance.now();
-        if (now - this.embAt < this.embIntervalMs) {
-          if (this.lastEmbVec && now - this.lastEmbAt < 1500) return [this.lastEmbVec];
-          return [];
-        }
+        if (!force && now - this.embAt < this.embIntervalMs) return;
         this.embAt = now;
+        this.embBusy = true;
+        this._embedNow()
+          .catch(() => {})
+          .finally(() => { this.embBusy = false; });
+      },
+
+      async _embedNow() {
         try {
           const faceapi = this.faceapi;
           const canvas = this.detectCanvas;
@@ -555,7 +569,7 @@
           this.beatWorker = w;
           // Visible marker so it is obvious from DevTools which build is live
           // (dsh serves the client bundle from memory captured at startup).
-          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261110b)');
+          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261110c)');
         } catch {
           // Worker construction blocked (strict CSP etc.) — old behaviour.
           this.timer = setInterval(() => this._send(), this.intervalMs);
@@ -746,12 +760,17 @@
               if (det.descs && det.descs.length) body.descs = det.descs;
               this.diag.err = null;
             }
-            // CNN embedding (rate-limited inside): only when a face is
-            // actually visible, otherwise it is pure CPU for nothing.
+            // CNN embedding: fired in the background, never awaited — the beat
+            // itself must stay on schedule. Each beat carries the freshest
+            // COMPLETED vector, so the server always sees the latest identity
+            // evidence without the heartbeat paying the inference latency.
             if (det && det.count > 0 && this.embOk) {
-              const v2 = await this._embedV2();
-              if (v2 && v2.length) body.descs2 = v2;
+              this._pumpEmbed(this.lastFaceCount === 0);   // face just (re)appeared
+              if (this.lastEmbVec && performance.now() - this.lastEmbAt < 2500) {
+                body.descs2 = [this.lastEmbVec];
+              }
             }
+            if (det) this.lastFaceCount = det.count;
           }
           if (this.diag.err) body.err = String(this.diag.err).slice(0, 200);
           const r = await fetchJson(`${BACKEND_URL}/heartbeat`, {
