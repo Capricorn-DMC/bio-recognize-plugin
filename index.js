@@ -10,7 +10,7 @@ import http from 'http';
 import https from 'https';
 import { URL } from 'url';
 import { spawn, execFileSync } from 'child_process';
-import { createWriteStream } from 'fs';
+import { createWriteStream, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -46,7 +46,21 @@ async function ensureServer() {
         req.on('timeout', () => { req.destroy(); resolve(false); });
         req.end();
     });
-    if (alive) return { running: true, pid: null, message: 'Server already running' };
+    if (alive) {
+        // Adopting whatever answers /health used to be "good enough" — but the
+        // backend is spawned DETACHED on purpose (it must outlive a DSH
+        // restart so a black screen never sits behind a dead controller),
+        // which quietly turned every DSH restart into an adoption of the OLD
+        // process running the OLD code: the browser reloaded, the server did
+        // not, and "I restarted DSH and nothing changed" was the result.
+        // Replace any backend this plugin did not start, so the running code
+        // always matches the installed plugin.
+        if (await replaceStaleBackend()) {
+            // Port is free now — fall through and spawn the current code.
+        } else {
+            return { running: true, pid: null, message: 'Server already running' };
+        }
+    }
 
     // Another start is already in flight (e.g. the auto-start fired on plugin
     // load). Wait for it to finish instead of claiming success immediately —
@@ -69,6 +83,11 @@ async function ensureServer() {
             stdio: ['ignore', 'pipe', 'pipe'],
             detached: true,
         });
+        // Write the pid IMMEDIATELY (not after the health check): a DSH
+        // restart during the boot window would otherwise leave a stale pid
+        // file, and the next ensureServer would treat our own fresh backend
+        // as a foreign process and kill it.
+        try { writeFileSync(pidFile, String(serverProcess.pid)); } catch { /* best effort */ }
         // Keep the last chunk of backend output on disk: when something goes
         // wrong in the browser ("检测中" forever) the reason is almost always
         // in this log, and a piped-and-discarded stdio made it unrecoverable.
@@ -89,11 +108,6 @@ async function ensureServer() {
         // seconds). Previously a fixed 4s window made "start" report failure
         // while the server was in fact still booting.
         const up = await waitHealth(25000);
-        if (serverProcess?.pid) {
-            try {
-                import('fs').then(fs => fs.writeFileSync(pidFile, String(serverProcess.pid)));
-            } catch {}
-        }
         return { running: up, pid: serverProcess?.pid || null, message: up ? 'Server started' : 'Server process launched but health check failed' };
     } finally {
         if (serverStarting) serverStarting = false;
@@ -119,6 +133,27 @@ async function probeHealth() {
         req.on('timeout', () => { req.destroy(); resolve(false); });
         req.end();
     });
+}
+
+// Kill a backend we did not start (pid file mismatch) and free the port.
+// Returns true when the port is free and a fresh spawn should follow.
+async function replaceStaleBackend() {
+    const pidFile = join(__dirname, 'models', '.server.pid');
+    let ours = 0;
+    try { ours = parseInt(readFileSync(pidFile, 'utf8').trim(), 10) || 0; } catch { /* no file yet */ }
+    const live = listenerPid(SERVER_PORT);
+    if (!live) return false;                     // nothing to replace
+    if (ours && live === ours) return false;     // ours, in sync
+    try {
+        execFileSync('taskkill', ['/PID', String(live), '/T', '/F'], { stdio: 'ignore', timeout: 8000 });
+    } catch {
+        try { process.kill(live, 'SIGTERM'); } catch { return false; /* keep the running one */ }
+    }
+    // "Signal sent" is not proof: wait for the port to be released.
+    for (let i = 0; i < 20 && listenerPid(SERVER_PORT); i++) {
+        await new Promise(r => setTimeout(r, 250));
+    }
+    return !listenerPid(SERVER_PORT);
 }
 
 function pidAlive(pid) {
