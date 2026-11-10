@@ -13,3 +13,4 @@ models/_cursor_handle.txt
 # OS junk
 Thumbs.db
 .DS_Store
+models/presence.log
