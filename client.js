@@ -294,7 +294,7 @@
 
       // Compute the 128-D embedding of the largest face(s) currently visible.
       // Runs at most once per embIntervalMs; between runs the previous vector
-      // is reused (valid for 1.5s), which keeps the heartbeat cadence intact.
+      // is reused (valid for 2.5s), which keeps the heartbeat cadence intact.
       // Kick an embedding WITHOUT waiting for it. The heartbeat must never be
       // blocked by inference: in a hidden tab one inference can take 2-3s,
       // and awaiting it stretched the beat cadence past the server's identity
@@ -316,14 +316,35 @@
       async _embedNow() {
         try {
           const faceapi = this.faceapi;
-          const canvas = this.detectCanvas;
-          if (!faceapi || !canvas || !canvas.width) return [];
+          const video = this.video;
+          if (!faceapi || !video || !video.videoWidth) return [];
+          // Dedicated canvas, repainted once per inference.
+          //
+          // This used to read the SAME canvas that the 350ms fast detector
+          // repaints. Two things went wrong: tf.js read a half-drawn frame
+          // (the 0.55–0.60 similarity spikes against a face that scored 0.97 a
+          // beat earlier), and while the read was in flight pico.js was handed
+          // a partially painted canvas, so it reported faces=0 for the whole
+          // 2–3s inference. That single shared buffer is what turned "user is
+          // sitting right there" into "no face for 1.4s" → screen off → next
+          // frame face again → screen on. One private snapshot per inference
+          // keeps the fast path and the slow path completely independent.
+          if (!this.embCanvas) this.embCanvas = document.createElement('canvas');
+          const canvas = this.embCanvas;
+          const w = video.videoWidth, hh = video.videoHeight;
+          if (canvas.width !== w || canvas.height !== hh) { canvas.width = w; canvas.height = hh; }
+          if (!this.embCtx) this.embCtx = canvas.getContext('2d', { willReadFrequently: true });
+          this.embCtx.drawImage(video, 0, 0);
           const t0 = performance.now();
           const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.4 });
           const res = await faceapi.detectAllFaces(canvas, opts)
             .withFaceLandmarks()
             .withFaceDescriptors();
           this.diag.embMs = Math.round(performance.now() - t0);
+          // A machine that cannot do this in ~1.5s is spending most of its
+          // time inside the graph. Back off instead of hammering it: a slower
+          // identity cadence is harmless, a constantly busy GPU is not.
+          this.embIntervalMs = this.diag.embMs > 1500 ? 3000 : 1200;
           if (!res || !res.length) { this.lastEmbVec = null; return []; }
           res.sort((a, b) => b.detection.box.width - a.detection.box.width);
           const out = [];
@@ -423,6 +444,15 @@
             for (let c = 0; c < w; ++c)
               gray[r * w + c] = (2 * rgba[r * 4 * w + 4 * c] + 7 * rgba[r * 4 * w + 4 * c + 1] + rgba[r * 4 * w + 4 * c + 2]) / 10;
           const minDim = Math.min(w, hgt);
+          // Blank-frame guard. A saturated pipeline can hand back an all-black
+          // capture; pico.js then reports "0 faces" with no error at all, and a
+          // silent zero is indistinguishable from "the user walked away". The
+          // only honest answer for that frame is "I could not see", which the
+          // server must not read as absence.
+          let lsum = 0, lcount = 0;
+          for (let i = 0; i < gray.length; i += 37) { lsum += gray[i]; lcount++; }
+          const meanLuma = lcount ? lsum / lcount : 0;
+          const frameBad = meanLuma < 6 || meanLuma > 252;
           // Window set tuned for a face in front of a laptop camera. The old
           // range (12%…90% of the short side, scale 1.15) produced ~15 cascade
           // scales and cost ~16ms per frame — 2x more than needed, and that CPU
@@ -441,7 +471,7 @@
           );
           const dets = this.pico.cluster_detections(dts, 0.1).filter(d => d[3] >= 5.0);
           const ms = performance.now() - t0;
-          if (!dets.length) return { count: 0, descs: [], ms };
+          if (!dets.length) return { count: 0, descs: [], ms, bad: frameBad };
           const descs = [];
           if (this.faceDesc) {
             dets.sort((a, b) => b[3] - a[3]);      // best quality face first
@@ -453,7 +483,7 @@
               if (vec) descs.push(Array.from(vec, v => Math.round(v * 1000) / 1000));
             }
           }
-          return { count: dets.length, descs, ms };
+          return { count: dets.length, descs, ms, bad: frameBad };
         } catch (e) {
           this.diag.err = 'detect: ' + (e?.message || e);
           return null;
@@ -569,7 +599,7 @@
           this.beatWorker = w;
           // Visible marker so it is obvious from DevTools which build is live
           // (dsh serves the client bundle from memory captured at startup).
-          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261110d)');
+          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261110e)');
         } catch {
           // Worker construction blocked (strict CSP etc.) — old behaviour.
           this.timer = setInterval(() => this._send(), this.intervalMs);
@@ -755,6 +785,13 @@
             const det = this._detectFaces();
             if (det) {
               this.diag.ms = Math.round(det.ms * 10) / 10;
+              // A zero is only evidence when the frame was readable and no
+              // inference was occupying the pipeline. Otherwise say "blind"
+              // explicitly instead of letting the server conclude "left".
+              // Bounded on the server side (4s), so this can delay an absence
+              // conclusion but never hide one.
+              const blind = !!det.bad || (det.count === 0 && this.embBusy);
+              if (blind) body.blind = true;
               body.faces = det.count;
               body.ms = this.diag.ms;
               if (det.descs && det.descs.length) body.descs = det.descs;
@@ -766,11 +803,14 @@
             // evidence without the heartbeat paying the inference latency.
             if (det && det.count > 0 && this.embOk) {
               this._pumpEmbed(this.lastFaceCount === 0);   // face just (re)appeared
-              if (this.lastEmbVec && performance.now() - this.lastEmbAt < 2500) {
+              if (this.lastEmbVec && performance.now() - this.lastEmbAt < 5000) {
                 body.descs2 = [this.lastEmbVec];
               }
             }
-            if (det) this.lastFaceCount = det.count;
+            // Remember the last count only from a frame we could trust: a
+            // blind zero must not overwrite "there was a face a moment ago",
+            // otherwise the blind heuristic disarms itself on the second beat.
+            if (det && !blind) this.lastFaceCount = det.count;
           }
           if (this.diag.err) body.err = String(this.diag.err).slice(0, 200);
           const r = await fetchJson(`${BACKEND_URL}/heartbeat`, {

@@ -78,6 +78,7 @@ function presenceLog(kind) {
             idMatched: id && id.matched, idScore: id ? id.lastScore : null,
             cam: d.cam, det: d.det, faces: d.faces, ms: d.ms,
             emb: d.emb, embMs: d.embMs, nocam: d.nocam || false,
+            blindMs: p && p.blindMs || 0, dip: id && id.dipCount || 0,
         });
         appendFileSync(PRESENCE_LOG, line + '\n', 'utf8');
         console.log('[PresenceLog]', line);
@@ -804,7 +805,18 @@ class IdentityMatcher {
         this.lastUserId = userId;
         this.lastAt = Date.now();
         this.lastDim = vec.length;
-        this.ema = this.ema == null ? score : this.ema * 0.55 + score * 0.45;
+        // Rate-limit the DOWNWARD step. A torn embedding scored 0.55 on a face
+        // that had just scored 0.97, and a plain EMA followed it straight
+        // through the release line in one beat: identity expired, presence
+        // expired, the screen went black while the owner was sitting in front
+        // of it. A real stranger arrives with a RUN of low scores, not one
+        // outlier — so a lone dip may move the EMA by 0.035 at most, while two
+        // consecutive dips allow a genuine fall.
+        const dip = this.ema != null && score < this.ema - 0.10;
+        this.dipCount = dip ? (this.dipCount || 0) + 1 : 0;
+        if (this.ema == null) this.ema = score;
+        else if (score > this.ema) this.ema = this.ema + Math.min(score - this.ema, 0.12);
+        else this.ema = this.ema - Math.min(this.ema - score, this.dipCount >= 2 ? 0.20 : 0.035);
         const release = Math.max(0.30, useThr - (vec.length === EMB_DIM_V2 ? 0.03 : 0.08));
         // A single decisive frame wins immediately: waiting for the EMA to climb
         // cost 2–3 beats (~1s) every time the user sat back down, which is most
@@ -813,7 +825,7 @@ class IdentityMatcher {
         // verified user off.
         const strong = score >= useThr + 0.03;
         if (!this.matched && (this.ema >= useThr || strong)) this.matched = true;
-        else if (this.matched && this.ema < release && !strong) this.matched = false;
+        else if (this.matched && this.ema < release && !strong && this.dipCount >= 2) this.matched = false;
         if (this.matched) this.lastMatchedAt = this.lastAt;
         this.verdict = this.matched ? 'self'
             : (this.ema != null && this.ema <= useThr - (vec.length === EMB_DIM_V2 ? REJECT_V2_MARGIN : 0.10))
@@ -882,6 +894,8 @@ class PresenceEngine {
         this.absentStreakStart = null; // start of the current continuous absence streak
         this.keyHeldSince = null;      // since when Shift/Esc has been held (escape hatch)
         this.faceStreak = 0;           // consecutive heartbeats carrying >=1 face
+        this.blindAt = null;           // last beat where the client declared itself blind
+        this.blindMs = 0;              // how long the current blind window has lasted
         this.escapeDeadline = 0;       // when an escape-woken screen gets re-verified
         this.reason = null;            // why the last state change happened (diagnostics)
 
@@ -1005,13 +1019,14 @@ class PresenceEngine {
         // gaps, and a grace of 1.5x interpreted those as "user left" — the
         // screen blanked for a second while the user was sitting right there.
         //
-        // 2.8x (~3 missed beats at a 300ms clock) on purpose: restoring the
-        // backlight changes the camera exposure, and the detector goes blind
-        // for 1-3 beats right after a wake. That gap used to blank the screen
-        // 1.8s after it lit up, then light it again on the next frame — the
-        // "wakes, goes black once, then stays on" symptom.
+        // Measured, not guessed: on this machine a CNN inference takes 2.4–3s,
+        // and while it runs the fast detector reports "no face" for 1.0–1.4s
+        // (models/presence.log: every OFF event carried faceAgeMs 983…1404 with
+        // faces=0). A grace shorter than ~1.8s therefore blanks the screen in
+        // the middle of a long inference, and the next frame lights it again —
+        // exactly the "lights up, goes black once, then stays on" report.
         const faceGrace = Math.min(
-            Math.max(cfg.faceGraceMs || 450, hbInterval * 2.8, 360), 4000);
+            Math.max(cfg.faceGraceMs || 450, hbInterval * 2.8, 1800), 4000);
         const faceEnabled = cfg.faceEnabled !== false;
 
         // A detector only counts as usable while heartbeats still carry its
@@ -1020,6 +1035,15 @@ class PresenceEngine {
         // would blank the screen out from under a user who is clearly typing.
         const faceUsable = faceEnabled && this.lastNumericFaceAt &&
             (now - this.lastNumericFaceAt) < 5000;
+
+        // The client can declare its own frame unusable — a blank capture, or
+        // an inference occupying the camera pipeline. "I could not see" is not
+        // "nobody is here": it must freeze the decision exactly like a silent
+        // heartbeat does. Bounded to 4s so a permanently broken camera still
+        // falls through to the normal watchdog path instead of hiding forever.
+        const blindRecent = this.blindAt &&
+            (now - this.blindAt) < Math.max(hbInterval * 2.5, 900);
+        const sensorBlind = !!(blindRecent && (this.blindMs || 0) <= 4000);
 
         // ── Identity gate (1:N) ──────────────────────────────────────
         // A detected face only proves presence if it matches an enrolled
@@ -1038,7 +1062,18 @@ class PresenceEngine {
         // decouples inference from the beat, so this is only a safety margin
         // for genuinely slow clocks — a stranger is still caught by the next
         // embedding that arrives, which flips the verdict to 'other'.
-        const idWindow = Math.min(Math.max(2000, hbInterval * 2.5), 6000);
+        // Two different questions, two different tolerances:
+        //   • while the panel is BLACK: may this face wake it? → must be a
+        //     RECENT match, otherwise a stranger could inherit the owner's
+        //     still-warm confirmation.
+        //   • while the panel is ON: is the owner still here? → the grace is
+        //     generous, because a slow embedding only proves the CNN is behind,
+        //     not that the owner walked off.
+        // One shared 2s window used to answer both, and it expired presence in
+        // the middle of every 2.4–3s inference (see embMs in presence.log).
+        const idWindowWake = Math.min(Math.max(2500, hbInterval * 2.5), 6000);
+        const idWindowOn = Math.min(Math.max(6000, hbInterval * 4), 12000);
+        const idWindow = this.screen.isBlack ? idWindowWake : idWindowOn;
         // Freshness is measured from the last CONFIRMED match, not from the
         // last frame that happened to score below the threshold. Threshold
         // noise (0.92 vs 0.93 on the same face) used to expire presence for a
@@ -1203,6 +1238,16 @@ class PresenceEngine {
                 return;
             }
 
+            // Blind, not empty: the detector itself said this frame is
+            // unusable. Restart the absence clock so a 2–3s inference can
+            // never accumulate towards a blackout.
+            if (sensorBlind) {
+                this.absentStreakStart = now;
+                this.state = 'unknown';
+                this.reason = 'sensor-blind';
+                return;
+            }
+
             const absentMs = now - this.absentStreakStart;
 
             // ── Escape hatch: KEYBOARD ONLY ─────────────────────────────
@@ -1273,6 +1318,7 @@ class PresenceEngine {
         this.faceStreak = 0;
         this.keyHeldSince = null;
         this.escapeDeadline = 0;
+        this.blindMs = 0;
     }
 }
 
@@ -1551,7 +1597,7 @@ class BioRecognizeBackend {
         // (still loading, camera hiccup). Only a real number marks the
         // detector as usable — a missing detector must never be read as
         // "no face here".
-        if (typeof data.faces === 'number') {
+        if (typeof data.faces === 'number' && !data.blind) {
             this.presence.lastNumericFaceAt = now;
             if (data.faces >= 1) {
                 this.presence.faceSeenAt = now;
@@ -1562,6 +1608,19 @@ class BioRecognizeBackend {
             } else {
                 this.presence.faceStreak = 0;
             }
+        }
+
+        // Blind window bookkeeping. The client flags a beat when it could not
+        // read the frame at all (blank capture) or when the fast detector ran
+        // while a 2–3s inference held the pipeline. Such a zero is not
+        // evidence of an empty desk, so it must not touch faceSeenAt or the
+        // streak — only extend the blind window, which the presence engine
+        // treats as "we stopped looking" rather than "the user left".
+        if (data.blind) {
+            this.presence.blindAt = now;
+            this.presence.blindMs = Math.min((this.presence.blindMs || 0) + (this.hbIntervalMs || 350), 5000);
+        } else {
+            this.presence.blindMs = 0;
         }
 
         // Live face descriptor(s) (computed by the client with the same
