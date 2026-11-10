@@ -113,7 +113,7 @@ let config = {
     bioOnly: true,
     wakeHoldMs: 200,       // presence must hold this long before waking
     minBlackMs: 600,       // minimum time black before a wake is allowed
-    wakeGuardMs: 1500,     // after a wake, ignore absence for this long
+    wakeGuardMs: 3000,     // after a wake, ignore absence this long (exposure settles)
     // ── Escape hatch (KEYBOARD ONLY) ───────────────────────────────────
     // bioOnly means a mouse move can never wake the screen. That used to be
     // true for presence but NOT for the old manualOverrideMs path, which
@@ -127,7 +127,7 @@ let config = {
     escapeVerifyMs: 5000,  // after a forced wake: no recognised face in this
                            // window → black out again (a stranger cannot keep
                            // the screen alive with the keyboard either)
-    wakeStreakFrames: 2,   // consecutive face frames required before waking
+    wakeStreakFrames: 3,   // consecutive face frames required before waking
     watchdogMs: 8000,      // no client heartbeat for this long → stand down
     // ── Identity (1:N face matching) ───────────────────────────────────
     // identityCheck: a detected face only counts if it matches an enrolled
@@ -614,6 +614,11 @@ class IdentityMatcher {
         this.lastScore = null;
         this.lastUserId = null;
         this.lastAt = null;
+        // Last time identity was CONFIRMED (not merely attempted). Presence
+        // reads this instead of `matched`, so one blurry frame that flips the
+        // verdict to 'unknown' does not read as "the owner left" while the
+        // owner is still sitting there.
+        this.lastMatchedAt = null;
         this.enrolled = 0;
         this.refsV2 = 0;       // CNN references available
         this.refsV1 = 0;       // legacy HOG references available
@@ -809,6 +814,7 @@ class IdentityMatcher {
         const strong = score >= useThr + 0.03;
         if (!this.matched && (this.ema >= useThr || strong)) this.matched = true;
         else if (this.matched && this.ema < release && !strong) this.matched = false;
+        if (this.matched) this.lastMatchedAt = this.lastAt;
         this.verdict = this.matched ? 'self'
             : (this.ema != null && this.ema <= useThr - (vec.length === EMB_DIM_V2 ? REJECT_V2_MARGIN : 0.10))
                 ? 'other' : 'unknown';
@@ -998,9 +1004,14 @@ class PresenceEngine {
         // detector that misses ~7% of frames produces occasional two-frame
         // gaps, and a grace of 1.5x interpreted those as "user left" — the
         // screen blanked for a second while the user was sitting right there.
-        // 2.2x tolerates two consecutive misses.
+        //
+        // 2.8x (~3 missed beats at a 300ms clock) on purpose: restoring the
+        // backlight changes the camera exposure, and the detector goes blind
+        // for 1-3 beats right after a wake. That gap used to blank the screen
+        // 1.8s after it lit up, then light it again on the next frame — the
+        // "wakes, goes black once, then stays on" symptom.
         const faceGrace = Math.min(
-            Math.max(cfg.faceGraceMs || 450, hbInterval * 1.8, 360), 4000);
+            Math.max(cfg.faceGraceMs || 450, hbInterval * 2.8, 360), 4000);
         const faceEnabled = cfg.faceEnabled !== false;
 
         // A detector only counts as usable while heartbeats still carry its
@@ -1028,7 +1039,11 @@ class PresenceEngine {
         // for genuinely slow clocks — a stranger is still caught by the next
         // embedding that arrives, which flips the verdict to 'other'.
         const idWindow = Math.min(Math.max(2000, hbInterval * 2.5), 6000);
-        const idFresh = !!(id && id.matched && id.lastAt && (now - id.lastAt) < idWindow);
+        // Freshness is measured from the last CONFIRMED match, not from the
+        // last frame that happened to score below the threshold. Threshold
+        // noise (0.92 vs 0.93 on the same face) used to expire presence for a
+        // beat and blank the screen for a second.
+        const idFresh = !!(id && id.lastMatchedAt && (now - id.lastMatchedAt) < idWindow);
         this.idRequired = idRequired;
         this.idFresh = idFresh;
 
@@ -1038,7 +1053,7 @@ class PresenceEngine {
         // 600ms black floor alone and re-light the display ~0.6s later — the
         // "goes black, then bright again" flicker. While the screen is ON none
         // of this applies: the normal absence path handles an empty desk.
-        const wakeStreakNeeded = Math.min(Math.max(parseInt(cfg.wakeStreakFrames, 10) || 2, 1), 5);
+        const wakeStreakNeeded = Math.min(Math.max(parseInt(cfg.wakeStreakFrames, 10) || 3, 1), 5);
         const faceAfterBlack = !this.screen.isBlack ||
             (!!this.faceSeenAt && !!this.screen.blackSince && this.faceSeenAt > this.screen.blackSince);
         const streakOk = !this.screen.isBlack || this.faceStreak >= wakeStreakNeeded;
@@ -1157,7 +1172,7 @@ class PresenceEngine {
             // for wakeGuardMs. Blacking the screen changes the room light,
             // which can make the next detection frames fail — without this
             // the engine could cycle wake→black→wake every couple of seconds.
-            const wakeGuardMs = Math.min(Math.max(cfg.wakeGuardMs || 2000, 0), 10000);
+            const wakeGuardMs = Math.min(Math.max(cfg.wakeGuardMs || 3000, 0), 10000);
             if (this.screen.lastOnAt && (now - this.screen.lastOnAt) < wakeGuardMs) {
                 this.absentStreakStart = now;
                 return;
@@ -1651,6 +1666,7 @@ class BioRecognizeBackend {
             this.identity.matched = false;
             this.identity.ema = null;
             this.identity.lastAt = null;
+            this.identity.lastMatchedAt = null;
         }
         return r;
     }
@@ -1667,7 +1683,7 @@ class BioRecognizeBackend {
         if (data.bioOnly !== undefined) config.bioOnly = true;   // not user-facing any more
         if (data.wakeHoldMs !== undefined) config.wakeHoldMs = Math.min(Math.max(parseInt(data.wakeHoldMs, 10) || 250, 100), 3000);
         if (data.minBlackMs !== undefined) config.minBlackMs = Math.min(Math.max(parseInt(data.minBlackMs, 10) || 700, 0), 5000);
-        if (data.wakeGuardMs !== undefined) config.wakeGuardMs = Math.min(Math.max(parseInt(data.wakeGuardMs, 10) || 2000, 0), 10000);
+        if (data.wakeGuardMs !== undefined) config.wakeGuardMs = Math.min(Math.max(parseInt(data.wakeGuardMs, 10) || 3000, 0), 10000);
         if (data.identityCheck !== undefined) config.identityCheck = true;  // ditto
         if (data.matchThreshold !== undefined) config.matchThreshold = Math.min(Math.max(parseFloat(data.matchThreshold) || 0.65, 0.3), 0.95);
         if (data.matchThresholdV2 !== undefined) config.matchThresholdV2 = Math.min(Math.max(parseFloat(data.matchThresholdV2) || THRESH_V2_DEFAULT, 0.60), 0.98);
@@ -1676,7 +1692,7 @@ class BioRecognizeBackend {
         // the Shift/Esc escape hatch.
         if (data.keyEscapeMs !== undefined) config.keyEscapeMs = Math.min(Math.max(parseInt(data.keyEscapeMs, 10) || 0, 0), 60000);
         if (data.escapeVerifyMs !== undefined) config.escapeVerifyMs = Math.min(Math.max(parseInt(data.escapeVerifyMs, 10) || 5000, 1000), 15000);
-        if (data.wakeStreakFrames !== undefined) config.wakeStreakFrames = Math.min(Math.max(parseInt(data.wakeStreakFrames, 10) || 2, 1), 5);
+        if (data.wakeStreakFrames !== undefined) config.wakeStreakFrames = Math.min(Math.max(parseInt(data.wakeStreakFrames, 10) || 3, 1), 5);
 
         // Any judgement-rule change starts from a clean slate — stale streaks
         // from the previous rule would otherwise fire an action immediately.

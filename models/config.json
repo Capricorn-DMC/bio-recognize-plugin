@@ -10,7 +10,7 @@
   "bioOnly": true,
   "wakeHoldMs": 200,
   "minBlackMs": 600,
-  "wakeGuardMs": 1500,
+  "wakeGuardMs": 3000,
   "watchdogMs": 8000,
   "identityCheck": true,
   "matchThreshold": 0.65,
@@ -20,5 +20,5 @@
   "learnFaces": true,
   "keyEscapeMs": 8000,
   "escapeVerifyMs": 5000,
-  "wakeStreakFrames": 2
+  "wakeStreakFrames": 3
 }
