@@ -21,14 +21,16 @@ cd bio-recognize-plugin
 npm install           # 无外部依赖，仅校验 manifest
 ```
 
-在 DSH 中安装（二选一）：
+在 DSH 中安装（三选一）：
 
-```powershell
-# 方式 1：本地目录安装（推荐开发时用）
-# 在 DSH 中：插件管理 → 安装 → 选择本目录
+```bash
+# 方式 1：CLI 源码安装（推荐，复制即可用）
+dsh plugin --profile web add github:Capricorn-DMC/bio-recognize-plugin
 
-# 方式 2：npm 安装（发布后）
-# 在 DSH 中：插件管理 → 安装 → @local/bio-recognize
+# 方式 2：DSH 中插件管理 → 安装 → 选择本目录（本地开发）
+
+# 方式 3：npm 安装（如已发布 npm 包）
+# dsh plugin --profile web add @capricorn-dmc/bio-recognize
 ```
 
 ## 使用
