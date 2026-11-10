@@ -769,6 +769,31 @@
         // feel progressively slower).
         if (this.inFlight) return;
         this.inFlight = true;
+        // Camera liveness on the BEAT path. The watchdog uses a 1s
+        // setInterval, which a hidden page throttles into silence — so the
+        // exact failure that needs it (the video element paused or the track
+        // dead while the page is in the background) is the one it can never
+        // see, and the beats kept arriving with a stale cam:'ok' and no
+        // faces while the server waited forever. The beat runs on the worker
+        // clock, so it always fires: check here, reopen after 2.5s of death,
+        // and let the beat carry the truth.
+        {
+          const v = this.video;
+          const alive = !!(v && v.videoWidth && v.readyState >= 2 &&
+            this.stream && this.stream.getVideoTracks().some(t => t.readyState === 'live'));
+          if (alive) {
+            this.noFrameSince = null;
+            if (this.diag.cam !== 'ok' && this.diag.cam !== 'idle') { this.diag.cam = 'ok'; this.diag.err = null; }
+          } else {
+            if (this.noFrameSince == null) this.noFrameSince = Date.now();
+            this.diag.cam = this.video ? 'novideo' : 'error';
+            if (Date.now() - this.noFrameSince > 2500 && Date.now() > this.recoverAt) {
+              this.recoverAt = Date.now() + 4000;
+              console.warn('[Heartbeat] camera stalled — reopening (beat path)');
+              this._reopen();
+            }
+          }
+        }
         const body = { cam: this.diag.cam, det: this.picoReady ? 'ok' : 'missing' };
         // Tell the server this machine has NO camera device at all — the only
         // statement that may engage its input-idle fallback mode.

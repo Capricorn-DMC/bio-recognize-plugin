@@ -896,6 +896,7 @@ class PresenceEngine {
         this.faceStreak = 0;           // consecutive heartbeats carrying >=1 face
         this.blindAt = null;           // last beat where the client declared itself blind
         this.blindMs = 0;              // how long the current blind window has lasted
+        this.noPictureSince = null;    // first tick where beats arrived with no picture
         this.escapeDeadline = 0;       // when an escape-woken screen gets re-verified
         this.reason = null;            // why the last state change happened (diagnostics)
 
@@ -995,18 +996,50 @@ class PresenceEngine {
         const noPicture = !fallback && (cam === 'error' || cam === 'novideo' || cam === 'idle' ||
             det === 'missing' || numericSilent);
         if (noPicture) {
+            if (this.noPictureSince == null) this.noPictureSince = now;
+            const deadFor = now - this.noPictureSince;
             this.state = 'unknown';
             this.presentSince = null;
-            this.absentStreakStart = null;
+            this.absentStreakStart = now;
             this.keyHeldSince = null;
             if (this.screen.isBlack) {
-                console.log('[Presence] Camera/detector unavailable — restoring screen');
-                await this.screen.turnOn();
-                cfg.isScreenBlack = false;
-                this.reason = cam === 'error' || cam === 'novideo' ? 'camera-lost' : 'detector-missing';
+                // Black + no picture: short outages (camera re-open churn, a
+                // 2-3s inference blind window) keep waiting. A camera that has
+                // been dead for noPictureRestoreMs is not coming back on its
+                // own — hand the screen over once, exactly like the heartbeat
+                // watchdog does, instead of leaving a black panel whose only
+                // exit is the 8s key hatch (which escapeVerify would flip back
+                // to black 5s later — a loop, not an exit).
+                const restoreMs = Math.min(Math.max(parseInt(cfg.noPictureRestoreMs, 10) || 30000, 5000), 300000);
+                if (deadFor > restoreMs) {
+                    console.log('[Presence] Camera/detector unavailable for ' +
+                        `${Math.round(deadFor / 1000)}s — restoring screen once`);
+                    await this.screen.turnOn();
+                    cfg.isScreenBlack = false;
+                    this.noPictureSince = now;      // restart the clock, one restore per episode
+                    this.reason = cam === 'error' || cam === 'novideo' ? 'camera-lost' : 'detector-missing';
+                }
+            } else if (this.armed && !this.actionTaken &&
+                deadFor >= Math.min(Math.max(parseInt(cfg.noPictureBlankMs, 10) || 10000, 3000), 60000)) {
+                // Screen ON + no picture for noPictureBlankMs. This is the case
+                // that used to keep the panel lit FOREVER: the video element
+                // dies (paused by the browser when the page hides, stream
+                // ended), the beats keep coming with no `faces`, and "no
+                // evidence" was treated as "keep everything as it is". bioOnly
+                // promises only the owner's face keeps this screen on — a beat
+                // with no picture in it is not the owner's face. Blank it: if
+                // the camera recovers, a real face re-lights the panel in
+                // about a second, which is a cheap price for not leaving the
+                // desktop exposed for hours behind a dead camera.
+                this.actionTaken = true;
+                console.log(`[Presence] No picture for ${Math.round(deadFor / 1000)}s — turning screen off`);
+                await this.screen.turnOff();
+                cfg.isScreenBlack = true;
+                this.reason = 'no-picture';
             }
             return;
         }
+        this.noPictureSince = null;
 
         // ── 1. Biometric evidence ─────────────────────────────────────
         // Grace must scale with the ACTUAL sampling cadence: a throttled
@@ -1597,16 +1630,21 @@ class BioRecognizeBackend {
         // (still loading, camera hiccup). Only a real number marks the
         // detector as usable — a missing detector must never be read as
         // "no face here".
-        if (typeof data.faces === 'number' && !data.blind) {
+        if (typeof data.faces === 'number') {
+            // A blind beat still proves the DETECTOR is alive and sampling —
+            // without this, a 3s inference blind window looked like a dead
+            // camera and tripped the no-picture restore path.
             this.presence.lastNumericFaceAt = now;
-            if (data.faces >= 1) {
-                this.presence.faceSeenAt = now;
-                // Consecutive frames, not a single lucky detection: one frame
-                // was enough to satisfy "a face is here" and re-light a screen
-                // that had just gone black.
-                this.presence.faceStreak = (this.presence.faceStreak || 0) + 1;
-            } else {
-                this.presence.faceStreak = 0;
+            if (!data.blind) {
+                if (data.faces >= 1) {
+                    this.presence.faceSeenAt = now;
+                    // Consecutive frames, not a single lucky detection: one frame
+                    // was enough to satisfy "a face is here" and re-light a screen
+                    // that had just gone black.
+                    this.presence.faceStreak = (this.presence.faceStreak || 0) + 1;
+                } else {
+                    this.presence.faceStreak = 0;
+                }
             }
         }
 
@@ -1739,6 +1777,8 @@ class BioRecognizeBackend {
         if (data.absentThreshold !== undefined) config.absentThreshold = data.absentThreshold;
         if (data.faceGraceMs !== undefined) config.faceGraceMs = Math.min(Math.max(parseInt(data.faceGraceMs, 10) || 550, 400), 3000);
         if (data.awayDelayMs !== undefined) config.awayDelayMs = Math.min(Math.max(parseInt(data.awayDelayMs, 10) || 400, 300), 5000);
+        if (data.noPictureBlankMs !== undefined) config.noPictureBlankMs = Math.min(Math.max(parseInt(data.noPictureBlankMs, 10) || 10000, 3000), 60000);
+        if (data.noPictureRestoreMs !== undefined) config.noPictureRestoreMs = Math.min(Math.max(parseInt(data.noPictureRestoreMs, 10) || 30000, 5000), 300000);
         if (data.bioOnly !== undefined) config.bioOnly = true;   // not user-facing any more
         if (data.wakeHoldMs !== undefined) config.wakeHoldMs = Math.min(Math.max(parseInt(data.wakeHoldMs, 10) || 250, 100), 3000);
         if (data.minBlackMs !== undefined) config.minBlackMs = Math.min(Math.max(parseInt(data.minBlackMs, 10) || 700, 0), 5000);
@@ -1761,6 +1801,8 @@ class BioRecognizeBackend {
         this.presence.keyHeldSince = null;
         this.presence.escapeDeadline = 0;
         this.presence.actionTaken = false;
+        this.presence.noPictureSince = null;
+        this.presence.blindMs = 0;
         
         this._saveConfig();
         
