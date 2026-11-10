@@ -8,7 +8,7 @@
 
 import http from 'http';
 import { URL } from 'url';
-import { writeFileSync, readFileSync, existsSync, mkdirSync, unlinkSync } from 'fs';
+import { writeFileSync, readFileSync, existsSync, mkdirSync, unlinkSync, appendFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
@@ -49,6 +49,40 @@ let BACKEND_PORT = DEFAULT_PORT;
 const MODELS_DIR = join(__dirname, 'models');
 const DATA_FILE = join(MODELS_DIR, 'users.json');
 const CONFIG_FILE = join(MODELS_DIR, 'config.json');
+
+// ── Screen transition log ────────────────────────────────────────────
+// The backend is spawned detached by the host, so its console output is
+// usually discarded. Every ON/OFF flip therefore gets a one-line snapshot
+// appended to models/presence.log — the only way to answer "why did the
+// screen just flicker" after the fact. BACKEND_REF is wired up once the
+// backend instance exists.
+let BACKEND_REF = null;
+const PRESENCE_LOG = join(MODELS_DIR, 'presence.log');
+function presenceLog(kind) {
+    try {
+        const p = BACKEND_REF && BACKEND_REF.presence;
+        const now = Date.now();
+        const d = p && p.clientDiag || {};
+        const beatAge = p && p.lastBeatAt ? now - p.lastBeatAt : null;
+        const faceAge = p && p.faceSeenAt ? now - p.faceSeenAt : null;
+        const numAge = p && p.lastNumericFaceAt ? now - p.lastNumericFaceAt : null;
+        const id = p && p.identity;
+        const line = JSON.stringify({
+            t: new Date().toISOString(), kind,
+            state: p && p.state, reason: p && p.reason,
+            armed: p && p.armed, fallback: p && p.fallback,
+            beatAgeMs: beatAge, hbMs: p && p.hbIntervalMs ? Math.round(p.hbIntervalMs) : null,
+            faceAgeMs: faceAge, numAgeMs: numAge,
+            idVerdict: p && p.idVerdict, idFresh: p && p.idFresh,
+            idLastAgeMs: id && id.lastAt ? now - id.lastAt : null,
+            idMatched: id && id.matched, idScore: id ? id.lastScore : null,
+            cam: d.cam, det: d.det, faces: d.faces, ms: d.ms,
+            emb: d.emb, embMs: d.embMs, nocam: d.nocam || false,
+        });
+        appendFileSync(PRESENCE_LOG, line + '\n', 'utf8');
+        console.log('[PresenceLog]', line);
+    } catch { /* diagnostics must never break the screen control */ }
+}
 
 // Global state
 let users = {};
@@ -255,6 +289,7 @@ function GetBB { [int](Get-CimInstance -Namespace root/wmi -ClassName WmiMonitor
         this.isBlack = false;
         this.blackSince = null;
         this.lastOnAt = Date.now();
+        presenceLog('ON');
         if (this.dry) { console.log('[Screen] (dry-run) ON'); return { success: true, mode: 'dry-run' }; }
         // Signal the window first (it hides within ~120ms), then restore
         // brightness in the background so the state flip is immediate.
@@ -274,6 +309,7 @@ function GetBB { [int](Get-CimInstance -Namespace root/wmi -ClassName WmiMonitor
         if (this.isBlack) return { success: true, mode: 'already-black' };
         this.isBlack = true;
         this.blackSince = Date.now();
+        presenceLog('OFF');
         if (this.dry) { console.log('[Screen] (dry-run) OFF'); return { success: true, mode: 'dry-run' }; }
         // Who asked? Every unexpected black-out needs a name attached to it.
         console.log('[Screen] black out requested by', (new Error().stack || '').split('\n')[2]?.trim());
@@ -1618,6 +1654,7 @@ class BioRecognizeBackend {
 // ============================================================
 
 const backend = new BioRecognizeBackend();
+BACKEND_REF = backend;   // enable the screen-transition log
 
 // Set to true only after initialize() finishes. The port is bound BEFORE the
 // (slow) warm-up so /health answers instantly and the host's "start service"

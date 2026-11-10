@@ -555,7 +555,7 @@
           this.beatWorker = w;
           // Visible marker so it is obvious from DevTools which build is live
           // (dsh serves the client bundle from memory captured at startup).
-          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261110)');
+          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261110b)');
         } catch {
           // Worker construction blocked (strict CSP etc.) — old behaviour.
           this.timer = setInterval(() => this._send(), this.intervalMs);
@@ -921,7 +921,24 @@
       const [service, setService] = React.useState({ running: null, managedPid: null, busy: false });
       const [capture, setCapture] = React.useState(null);
 
-      const upd = (k, v) => setConfig(p => ({ ...p, [k]: v }));
+      const configRef = React.useRef(config);
+      React.useEffect(() => { configRef.current = config; }, [config]);
+
+      // Every toggle persists IMMEDIATELY. The status pill's 300ms heartbeat
+      // holder follows the BACKEND's `enabled` flag (via /presence polling),
+      // so a local-only change left the engine running: the user switched
+      // "启用检测" off and the screen kept going dark. Server-side saving on
+      // each change also means there is no separate "save" step to forget.
+      const upd = (k, v) => {
+        setConfig(p => ({ ...p, [k]: v }));
+        const next = { ...configRef.current, [k]: v };
+        fetchJson(`${BACKEND_URL}/config`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(next),
+        }, 5000).then(r => {
+          if (r && r.status === 'success') showMsg('success', '配置已保存');
+          else showMsg('error', (r && r.message) || '保存失败');
+        }).catch(() => showMsg('error', '网络错误，请确认后端已启动'));
+      };
       const showMsg = (type, text) => setMsg({ type, text });
 
       // ── Service control via Host RPC ──
@@ -1125,12 +1142,13 @@
           h('div', { style: s.row },
             h('span', { style: s.label }, '服务开关'),
             h('div', { style: { display: 'flex', gap: 8, flex: 1 } },
+              // Single toggle button: the label itself reflects the state,
+              // so there is exactly ONE control instead of button + switch.
               online
                 ? h('button', { onClick: stopService, disabled: service.busy, style: { ...s.btnSecondary, borderColor: T.error, color: T.error } },
-                    service.busy ? '停止中…' : '⏹ 停止服务')
+                    service.busy ? '停止中…' : '⏹ 关闭服务')
                 : h('button', { onClick: startService, disabled: service.busy, style: s.btnPrimary },
-                    service.busy ? '启动中…' : '▶ 启动服务'),
-              h(Toggle, { checked: !!online, onChange: v => v ? startService() : stopService() })
+                    service.busy ? '启动中…' : '▶ 启动服务')
             )
           ),
           service.running === null
