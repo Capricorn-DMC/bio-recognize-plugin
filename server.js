@@ -25,6 +25,16 @@ process.on('unhandledRejection', (e) => {
 });
 process.on('uncaughtException', (e) => {
     console.error('[FATAL-GUARD] uncaught exception:', e && e.stack ? e.stack : e);
+    // A failed bind is NOT survivable, and swallowing it is how this backend
+    // became a zombie: the process stayed alive with no listening socket, the
+    // plugin's /health probe saw nothing, the UI said "starting" forever, and
+    // its presence loop kept ticking against a port it did not own (found in
+    // the field: two such processes, one pegging a core at 90%).
+    // Exit loudly so the supervisor can see it and restart cleanly.
+    if (e && (e.code === 'EADDRINUSE' || e.code === 'EACCES')) {
+        console.error('[FATAL-GUARD] cannot bind the backend port — exiting');
+        process.exit(1);
+    }
 });
 
 // Decode a base64 image/audio payload and persist it under models/captures/
@@ -311,7 +321,19 @@ function GetBB { [int](Get-CimInstance -Namespace root/wmi -ClassName WmiMonitor
         try { writeFileSync(this.statePath, '0', 'utf8'); } catch {}
         const level = Math.min(100, Math.max(5, this.prevBrightness));
         try {
-            await this.worker.run(`SetBB ${level}`);
+            // Bounded, same as turnOff: the overlay is already hidden and the
+            // state flag already says "on", so a stalled shell must not hold
+            // the presence loop hostage. A late write is harmless.
+            const work = this.worker.run(`SetBB ${level}`, 2500);
+            const ok = await Promise.race([
+                work.then(() => true).catch(e => { throw e; }),
+                new Promise(r => setTimeout(() => r('pending'), 1200)),
+            ]);
+            if (ok === 'pending') {
+                console.warn('[Screen] backlight restore still pending — panel is on, write continues in background');
+                work.catch(() => {});
+                return { success: true, mode: 'brightness+window (deferred)' };
+            }
             console.log(`[Screen] backlight restored to ${level}%, window hidden`);
             return { success: true, mode: 'brightness+window' };
         } catch (e) {
@@ -899,6 +921,8 @@ class PresenceEngine {
         this.noPictureSince = null;    // first tick where beats arrived with no picture
         this.escapeDeadline = 0;       // when an escape-woken screen gets re-verified
         this.reason = null;            // why the last state change happened (diagnostics)
+        this.flipLog = [];             // timestamps of recent screen transitions
+        this.flipCooldownUntil = 0;    // circuit breaker for a flapping panel
 
         this.keepAlive = new KeepAlive();
         this.createdAt = Date.now();   // startup settle window (see checkPresence)
@@ -906,7 +930,8 @@ class PresenceEngine {
 
     async startDetection(cfg) {
         if (detectionTimer) {
-            clearInterval(detectionTimer);
+            clearTimeout(detectionTimer);
+            detectionTimer = null;
         }
 
         console.log('[Presence] Starting detection loop (tick: 250ms)');
@@ -915,20 +940,115 @@ class PresenceEngine {
         // Modern Standby — waking from standby shows the sign-in screen.
         this.keepAlive.start();
 
-        // 200ms tick: checkPresence only compares timestamps (cheap), and the
-        // tick is the last source of lag between "face gone" and "screen off".
-        detectionTimer = setInterval(async () => {
-            await this.checkPresence(cfg);
-        }, 200);
+        // SEQUENTIAL ticks, not setInterval.
+        //
+        // This was setInterval(async () => await checkPresence()) at 200ms,
+        // and that is a re-entrancy bomb: checkPresence awaits turnOn/turnOff,
+        // and a brightness write costs 1-3s through the PowerShell worker. So
+        // tick N was still parked inside a screen op when ticks N+1..N+15
+        // started, all reading the same mutable state. Observed in the wild:
+        // 154 turnOffs and 159 turnOns in one session, both "is the user
+        // here?" conclusions taken from the same frames, one core pegged at
+        // 90%, and /presence never answering because the event loop was
+        // buried under the pile-up.
+        //
+        // Recursive setTimeout makes "one conclusion at a time" structural:
+        // the next tick is only scheduled after the previous one finished.
+        const TICK_MS = 200;
+        const TICK_BUDGET_MS = 3000;   // a stuck screen op must not freeze the loop
+        const tick = async () => {
+            detectionTimer = null;
+            const t0 = Date.now();
+            let stuck = false;
+            let overBudget = false;
+            const work = this.checkPresence(cfg).catch(e => {
+                // A rejected screen op (PowerShell restarting, WMI hiccup) must
+                // never kill the loop — that leaves the plugin silently dead
+                // while the UI still says "检测中".
+                stuck = true;
+                console.error('[Presence] tick failed:', e.message);
+                this.presentSince = null;
+                this.absentStreakStart = null;
+            });
+            await Promise.race([
+                work,
+                new Promise(r => setTimeout(() => { overBudget = true; r(); }, TICK_BUDGET_MS)),
+            ]);
+            if (overBudget) {
+                console.warn(`[Presence] tick exceeded ${TICK_BUDGET_MS}ms — waiting for it instead of overlapping`);
+                // Wait it out: firing the next tick while the old one is still
+                // inside a screen op is precisely the re-entrancy bug this
+                // rewrite exists to kill. Bounded, so a genuine deadlock still
+                // lets the loop breathe.
+                await Promise.race([work, new Promise(r => setTimeout(r, 2000))]);
+            }
+            if (!running) return;
+            const spent = Date.now() - t0;
+            detectionTimer = setTimeout(tick, stuck ? 1000 : Math.max(20, TICK_MS - spent));
+        };
+        let running = true;
+        this._stopLoop = () => { running = false; };
+        detectionTimer = setTimeout(tick, TICK_MS);
     }
 
     stopDetection() {
+        if (this._stopLoop) { this._stopLoop(); this._stopLoop = null; }
         if (detectionTimer) {
-            clearInterval(detectionTimer);
+            clearTimeout(detectionTimer);
             detectionTimer = null;
             console.log('[Presence] Detection stopped');
         }
         this.keepAlive.stop();
+    }
+
+    // ── Flip-storm circuit breaker ──────────────────────────────────
+    // An engine that toggles the panel more than a dozen times a minute is
+    // not tracking a user; it is fighting itself over contradictory evidence
+    // (that is exactly what happened when overlapping ticks disagreed: 154
+    // offs and 159 ons in one session). Blanking on every doubt is the wrong
+    // failure mode — it burns a CPU core, wears the backlight, and reads as
+    // a flicker bug. When the limit trips, the panel is HELD ON for a
+    // cool-down and the episode is logged once, so the log shows one cause
+    // instead of a thousand symptoms.
+    _allowFlip(nextBlack, now) {
+        this.flipLog = this.flipLog.filter(t => now - t < 60000);
+        if (this.flipCooldownUntil) {
+            if (now < this.flipCooldownUntil) return !nextBlack;  // wake ok, blank not
+            this.flipCooldownUntil = 0;
+        }
+        if (this.flipLog.length >= 12) {
+            this.flipCooldownUntil = now + 30000;
+            this.flipLog = [];
+            console.error(`[Presence] Flip storm (>=12 transitions/min) — holding screen ON for 30s ` +
+                `(present=${this.state}, faces=${this.faceStreak}, verdict=${this.identity?.verdict}, reason=${this.reason})`);
+            return false;
+        }
+        return true;
+    }
+
+    // Every panel transition goes through these two: one place to record the
+    // transition, one place to refuse it. Returns false when the breaker held
+    // the transition back, so callers can keep cfg.isScreenBlack honest.
+    async _wake() {
+        const now = Date.now();
+        if (!this._allowFlip(false, now)) {
+            this.reason = 'flip-cooldown';
+            return false;
+        }
+        this.flipLog.push(now);
+        await this.screen.turnOn();
+        return true;
+    }
+
+    async _blank() {
+        const now = Date.now();
+        if (!this._allowFlip(true, now)) {
+            this.reason = 'flip-cooldown';
+            return false;
+        }
+        this.flipLog.push(now);
+        await this.screen.turnOff();
+        return true;
     }
 
     async checkPresence(cfg) {
@@ -958,8 +1078,7 @@ class PresenceEngine {
             // sub-second gap that will heal itself.
             if (this.screen.isBlack && hbAge > watchdogMs) {
                 console.log('[Presence] Client heartbeat lost — restoring screen');
-                await this.screen.turnOn();
-                cfg.isScreenBlack = false;
+                cfg.isScreenBlack = !(await this._wake());
                 this.reason = 'watchdog';
             }
             return;
@@ -1014,8 +1133,7 @@ class PresenceEngine {
                 if (deadFor > restoreMs) {
                     console.log('[Presence] Camera/detector unavailable for ' +
                         `${Math.round(deadFor / 1000)}s — restoring screen once`);
-                    await this.screen.turnOn();
-                    cfg.isScreenBlack = false;
+                    cfg.isScreenBlack = !(await this._wake());
                     this.noPictureSince = now;      // restart the clock, one restore per episode
                     this.reason = cam === 'error' || cam === 'novideo' ? 'camera-lost' : 'detector-missing';
                 }
@@ -1033,8 +1151,7 @@ class PresenceEngine {
                 // desktop exposed for hours behind a dead camera.
                 this.actionTaken = true;
                 console.log(`[Presence] No picture for ${Math.round(deadFor / 1000)}s — turning screen off`);
-                await this.screen.turnOff();
-                cfg.isScreenBlack = true;
+                cfg.isScreenBlack = !(await this._blank());
                 this.reason = 'no-picture';
             }
             return;
@@ -1187,8 +1304,7 @@ class PresenceEngine {
             } else if (now >= this.escapeDeadline && !this.screen.isBlack) {
                 this.escapeDeadline = 0;
                 console.log('[Screen] Forced wake not verified — blacking out again');
-                await this.screen.turnOff();
-                cfg.isScreenBlack = true;
+                cfg.isScreenBlack = !(await this._blank());
                 this.reason = 'escape-unverified';
                 this.actionTaken = true;
                 this.absentStreakStart = now;
@@ -1225,8 +1341,7 @@ class PresenceEngine {
                 // with the absence streak below, this kills the on/off flicker.
                 if (heldMs >= wakeHoldMs && blackFor >= minBlackMs) {
                     console.log(`[Screen] Presence held ${Math.round(heldMs)}ms (black ${Math.round(blackFor)}ms) — restoring`);
-                    await this.screen.turnOn();
-                    cfg.isScreenBlack = false;
+                    cfg.isScreenBlack = !(await this._wake());
                     this.reason = bioHit ? 'bio-present' : 'input-present';
                 }
             }
@@ -1303,8 +1418,7 @@ class PresenceEngine {
                     } else if (now - this.keyHeldSince >= escapeMs) {
                         console.log(`[Screen] Escape key held ${Math.round(now - this.keyHeldSince)}ms — forced wake`);
                         this.keyHeldSince = null;
-                        await this.screen.turnOn();
-                        cfg.isScreenBlack = false;
+                        cfg.isScreenBlack = !(await this._wake());
                         this.reason = 'key-escape';
                         // Bounded trust: the panel is on, but nobody has proven
                         // they are the owner. escapeVerifyMs later the engine
@@ -1343,8 +1457,7 @@ class PresenceEngine {
 
     async _executeAction(cfg, absentMs) {
         console.log(`[Presence] Absence held ${Math.round(absentMs || 0)}ms, turning screen off`);
-        await this.screen.turnOff();
-        cfg.isScreenBlack = true;
+        cfg.isScreenBlack = !(await this._blank());
         this.reason = 'absent';
         // Fresh wake evidence only: face frames from BEFORE this blackout must
         // not be able to light the panel again 600ms later.
@@ -1987,6 +2100,21 @@ const server = http.createServer(async (req, res) => {
     if (req.url === '/health') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'ok', ready, timestamp: new Date().toISOString() }));
+        return;
+    }
+
+    // Graceful self-termination, used by the plugin when it has to replace a
+    // backend it did not start. A signal needs process rights; an HTTP request
+    // needs none, and it survives the case that broke the last few restarts —
+    // the old backend ran with higher privileges than the process trying to
+    // kill it ("taskkill: 拒绝访问"), so the port stayed occupied, the fresh
+    // copy died on EADDRINUSE, and the stale code kept running forever.
+    // Bound to 127.0.0.1 and POST-only: nothing off-machine can reach it.
+    if (req.url === '/shutdown' && req.method === 'POST') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok', message: 'shutting down' }));
+        console.log('[Server] Shutdown requested by host — exiting');
+        setTimeout(() => process.exit(0), 150);
         return;
     }
 

@@ -29,36 +29,42 @@ let serverStarting = false;
  * already serving. Idempotent: returns immediately if health responds.
  */
 async function ensureServer() {
-    // If a health check succeeds, the server is up (possibly a previously
-    // started instance or one the user started manually).
-    const alive = await new Promise(resolve => {
-        const req = http.request({
-            hostname: '127.0.0.1',
-            port: SERVER_PORT,
-            path: '/health',
-            method: 'GET',
-            timeout: 1500,
-        }, res => {
-            res.resume();
-            res.on('end', () => resolve(true));
-        });
-        req.on('error', () => resolve(false));
-        req.on('timeout', () => { req.destroy(); resolve(false); });
-        req.end();
-    });
-    if (alive) {
-        // Adopting whatever answers /health used to be "good enough" — but the
-        // backend is spawned DETACHED on purpose (it must outlive a DSH
-        // restart so a black screen never sits behind a dead controller),
-        // which quietly turned every DSH restart into an adoption of the OLD
-        // process running the OLD code: the browser reloaded, the server did
-        // not, and "I restarted DSH and nothing changed" was the result.
-        // Replace any backend this plugin did not start, so the running code
-        // always matches the installed plugin.
-        if (await replaceStaleBackend()) {
-            // Port is free now — fall through and spawn the current code.
-        } else {
-            return { running: true, pid: null, message: 'Server already running' };
+    // Resolve the REAL owner of the port first — never the /health answer.
+    //
+    // /health is served by whatever process holds the socket, and a wedged
+    // backend can hold the socket while its event loop is too busy to answer
+    // (field evidence: /presence silent for 10s, health replying intermittently
+    // while one core burned at 90%). Trusting /health alone spawned a fresh
+    // copy against an occupied port; that copy died on EADDRINUSE, and the
+    // stale code kept running — "I restarted DSH and nothing changed", again.
+    let livePid = listenerPid(SERVER_PORT);
+    if (livePid) {
+        const ours = readPidFile();
+        if (livePid !== ours) {
+            console.log(`[Plugin] Port ${SERVER_PORT} is held by pid ${livePid} (pidfile: ${ours || 'none'}) — replacing it`);
+            // Order matters: ask it to quit over HTTP first. That needs no
+            // process rights, so it also works when the old backend runs with
+            // higher privileges than us ("taskkill: 拒绝访问").
+            if (await requestShutdown()) {
+                await waitPortFree(5000);
+            }
+            if (listenerPid(SERVER_PORT) && !(await replaceStaleBackend())) {
+                // Deliberately NOT spawning a second copy: it would die on
+                // EADDRINUSE and the user would be told "started" while
+                // nothing serves. Report the blocker instead.
+                const pid = listenerPid(SERVER_PORT);
+                return {
+                    running: false,
+                    pid: pid || livePid,
+                    error: `端口 ${SERVER_PORT} 被进程 ${pid || livePid} 占用且无法结束（可能是以管理员权限启动的）。` +
+                        `请以管理员身份执行：taskkill /PID ${pid || livePid} /F，然后再点启动服务。`,
+                };
+            }
+            livePid = listenerPid(SERVER_PORT);
+        }
+        if (livePid) {
+            const up = await probeHealth();
+            return { running: true, pid: livePid, message: up ? 'Server already running' : 'Server running (health slow — port is held)' };
         }
     }
 
@@ -77,6 +83,7 @@ async function ensureServer() {
     serverStarting = true;
     try {
         sweepOrphanBlackWindows();
+        sweepZombieBackends();
         // Detached so the backend outlives a DSH restart; pid file for later stop.
         const pidFile = join(__dirname, 'models', '.server.pid');
         serverProcess = spawn(process.execPath, [SERVER_SCRIPT], {
@@ -135,25 +142,82 @@ async function probeHealth() {
     });
 }
 
-// Kill a backend we did not start (pid file mismatch) and free the port.
-// Returns true when the port is free and a fresh spawn should follow.
-async function replaceStaleBackend() {
-    const pidFile = join(__dirname, 'models', '.server.pid');
-    let ours = 0;
-    try { ours = parseInt(readFileSync(pidFile, 'utf8').trim(), 10) || 0; } catch { /* no file yet */ }
-    const live = listenerPid(SERVER_PORT);
-    if (!live) return false;                     // nothing to replace
-    if (ours && live === ours) return false;     // ours, in sync
+// A backend that lost the bind race stays alive but owns nothing: no socket,
+// no client, only a presence loop and ~60MB. Found in the field after a failed
+// replace — one at 0% CPU, a harmless-looking leftover that still shows up in
+// the process list and confuses every later diagnosis. Sweep them.
+function sweepZombieBackends() {
     try {
-        execFileSync('taskkill', ['/PID', String(live), '/T', '/F'], { stdio: 'ignore', timeout: 8000 });
-    } catch {
-        try { process.kill(live, 'SIGTERM'); } catch { return false; /* keep the running one */ }
-    }
-    // "Signal sent" is not proof: wait for the port to be released.
-    for (let i = 0; i < 20 && listenerPid(SERVER_PORT); i++) {
+        const out = execFileSync('powershell', ['-NoProfile', '-Command',
+            "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | " +
+            "Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*bio-recognize*server.js*' } | " +
+            'Select-Object -ExpandProperty ProcessId',
+        ], { encoding: 'utf8', timeout: 15000 });
+        const pids = out.split(/\s+/).map(s => parseInt(s, 10)).filter(p => p > 0);
+        const live = listenerPid(SERVER_PORT);
+        let swept = 0;
+        for (const p of pids) {
+            if (p === live) continue;            // the real backend: handled by replaceStaleBackend
+            if (p === serverProcess?.pid) continue;
+            try { execFileSync('taskkill', ['/PID', String(p), '/T', '/F'], { stdio: 'ignore', timeout: 5000 }); swept++; } catch {}
+        }
+        if (swept) console.log(`[Plugin] swept ${swept} zombie backend process(es)`);
+    } catch { /* best effort */ }
+}
+
+function readPidFile() {
+    try { return parseInt(readFileSync(join(__dirname, 'models', '.server.pid'), 'utf8').trim(), 10) || 0; }
+    catch { return 0; }
+}
+
+// Ask the backend to exit on its own. Requires nothing but a socket, which is
+// the whole point: a higher-privileged process cannot be signalled by us, but
+// it can always answer its own HTTP port.
+async function requestShutdown() {
+    return await new Promise(resolve => {
+        const req = http.request({ hostname: '127.0.0.1', port: SERVER_PORT, path: '/shutdown', method: 'POST', timeout: 2000 },
+            res => { res.resume(); res.on('end', () => resolve(res.statusCode === 200)); });
+        req.on('error', () => resolve(false));
+        req.on('timeout', () => { req.destroy(); resolve(false); });
+        req.end();
+    });
+}
+
+async function waitPortFree(budgetMs) {
+    const deadline = Date.now() + budgetMs;
+    while (Date.now() < deadline) {
+        if (!listenerPid(SERVER_PORT)) return true;
         await new Promise(r => setTimeout(r, 250));
     }
     return !listenerPid(SERVER_PORT);
+}
+
+// Kill a backend we did not start (pid file mismatch) and free the port.
+// Returns true when the port is free and a fresh spawn should follow.
+async function replaceStaleBackend() {
+    const live = listenerPid(SERVER_PORT);
+    if (!live) return false;                     // nothing to replace
+    const ours = readPidFile();
+    if (ours && live === ours) return false;     // ours, in sync
+
+    // 1) Ask it to quit over HTTP — privilege-free.
+    if (await requestShutdown() && await waitPortFree(4000)) return true;
+
+    // 2) Fall back to a signal.
+    let signalled = false;
+    try {
+        execFileSync('taskkill', ['/PID', String(live), '/T', '/F'], { stdio: 'ignore', timeout: 8000 });
+        signalled = true;
+    } catch {
+        try { process.kill(live, 'SIGTERM'); signalled = true; } catch { signalled = false; }
+    }
+    if (!signalled) {
+        console.error(`[Plugin] Cannot stop pid ${live} holding port ${SERVER_PORT} — insufficient privileges.`);
+        return false;
+    }
+    if (await waitPortFree(5000)) return true;
+    console.error(`[Plugin] pid ${live} was signalled but still holds port ${SERVER_PORT}.`);
+    return false;
 }
 
 function pidAlive(pid) {
@@ -228,6 +292,11 @@ async function stopServer() {
     // survives until its watchdog notices — which looks like "stopping the
     // service blacks the screen".
     try { await callBackend('/screen', { action: 'on' }, { backendUrl: `http://127.0.0.1:${SERVER_PORT}` }); } catch {}
+
+    // Privilege-free path first: a backend started by an elevated DSH cannot
+    // be signalled from a normal-privilege context, but it always answers its
+    // own port.
+    if (await requestShutdown()) await waitPortFree(3000);
 
     // /T kills the whole tree: the resident PowerShell worker and the black
     // overlay window are children of the server and would otherwise survive
