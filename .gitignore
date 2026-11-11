@@ -18,3 +18,5 @@ Thumbs.db
 models/presence.log
 models/_boot.out
 models/_boot.err
+models/boot.out
+models/boot.err

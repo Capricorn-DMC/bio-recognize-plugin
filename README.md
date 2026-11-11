@@ -67,7 +67,8 @@ bio-recognize-plugin/
 
 - **Client ↔ Host**：浏览器 UI 通过 DSH `/api` RPC 载体调用 Host 方法（`start`/`stop`/`status`），Host 用 `child_process` 管理 `server.js` 进程（detached + PID 文件，跨 DSH 重启可管理）。
 - **设备采集**：摄像头帧 → JPEG base64；话筒 PCM → 手动编码 16-bit WAV → base64；后端解码存 `models/captures/` 后走统一的特征提取管线（光谱 / 暗圆分析）。
-- **服务端人脸兜底**：页面切到后台时主动释放摄像头（handoff 协议），后端用 `ffmpeg`（DirectShow）抓帧并在 Node 里跑同一套 pico 级联检测器（`vm` 沙箱加载 `vendor/pico.js`）。页面被宿主冻结时人脸检测照常工作：无人脸 N 秒（`serverFaceAwaySec`，默认 3s）熄屏、黑屏时出现人脸即唤醒。仅判定"有没有人"，身份核验仍由页面负责。摄像头被冻结页面锁住时自动退回键鼠空闲兜底（`blindAwaySec`）。
+- **服务端人脸兜底（handoff 协议）**：页面切到后台时主动交出摄像头（停全部轨道 → `srcObject=null` → `removeAttribute('src')` + `load()`，否则 Windows 上 DirectShow 句柄不会真正释放），并在心跳里带 `vis:hidden + handoff`；后端收到即用 `ffmpeg`（DirectShow，`fps=4, 320x240, rgb24`）抓帧，在 Node 里通过 `vm` 沙箱跑同一个 pico 级联检测器。判定规则与页面一致：无人脸 ≥ `serverFaceAwaySec`（默认 3s）熄屏，黑屏时出现人脸即唤醒；仅判断"有没有人"，身份核验仍由页面负责。
+- **接管不了时**：设备仍被冻结页面占住 → ffmpeg 打开失败，退回键鼠空闲兜底（`blindAwaySec`），不会因为"无画面"就在几秒内熄屏。ffmpeg 自身带 `-t 180` 生命周期上限，`_killProc()` 用 `taskkill /T /F` 硬杀，确保设备不会被泄漏的抓帧进程永久锁死。
 
 ## 安全注意
 

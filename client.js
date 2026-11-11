@@ -744,11 +744,27 @@
       _handoffCamera() {
         this.handoff = true;
         try {
-          if (this.stream) {
-            this.stream.getTracks().forEach(t => { try { t.stop(); } catch { /* noop */ } });
+          const s = this.stream;
+          if (s) {
+            // Stop EVERY track twice over: a single stop() on a track that the
+            // browser already ended can silently do nothing, and on Windows
+            // the DirectShow handle is only dropped once the last live track
+            // is gone. The device has to be genuinely free here, otherwise the
+            // server-side capture can never open it while this page is frozen.
+            s.getTracks().forEach(t => { try { t.stop(); } catch { /* noop */ } });
+            s.getVideoTracks().forEach(t => { try { t.enabled = false; t.stop(); } catch { /* noop */ } });
             this.stream = null;
           }
-          if (this.video) { try { this.video.srcObject = null; } catch { /* noop */ } }
+          const v = this.video;
+          if (v) {
+            try { v.pause(); } catch { /* noop */ }
+            try { v.srcObject = null; } catch { /* noop */ }
+            // load() tears the media pipeline down NOW. Without it Chromium
+            // keeps the capture session (and the camera light) alive for an
+            // unbounded time, which is exactly the "device busy" the server
+            // kept hitting.
+            try { v.removeAttribute('src'); v.load(); } catch { /* noop */ }
+          }
           this.diag.cam = 'handoff';
           this.noFrameSince = null;
         } catch { /* best effort */ }
@@ -759,13 +775,15 @@
         this.handoff = false;
         if (!this.running || !this.tokens.size) return;
         // The next beats carry vis:visible; the server stops its capture on
-        // the first one. Wait a beat's worth of time, then reopen.
+        // the first one. 2.5s (not 1.2s) because killing ffmpeg is instant but
+        // Windows releases the DirectShow device asynchronously — reopening
+        // too early is a NotReadableError the user sees as "camera busy".
         setTimeout(() => {
           if (!document.hidden && this.running && !this.stream) {
             console.info('[Heartbeat] resuming camera after handoff');
             this._reopen();
           }
-        }, 1200);
+        }, 2500);
       },
 
       // Count unhandled rejections raised by anything on this page. They are
@@ -1178,6 +1196,14 @@
           if (this.diag.migrate) body.migrate = this.diag.migrate;
           if (this.diag.backend) body.backend = this.diag.backend;
           const video = this.video;
+          // Declared OUTSIDE the frame block on purpose: the "remember the
+          // last count" line below also runs when detection produced nothing,
+          // and a block-scoped `const blind` there threw ReferenceError. That
+          // exception aborted the rest of the beat, so the server received NO
+          // faces at all whenever a picture was present — the detector looked
+          // dead in the foreground and only "worked" once the camera had been
+          // handed off (where this block is skipped entirely).
+          let blind = false;
           if (video && video.videoWidth) {
             const det = this._detectFaces();
             if (det) {
@@ -1187,8 +1213,8 @@
               // explicitly instead of letting the server conclude "left".
               // Bounded on the server side (4s), so this can delay an absence
               // conclusion but never hide one.
-              const blind = !!det.bad || (det.count === 0 && this.embBusy);
-              if (blind) body.blind = true;
+              const isBlind = !!det.bad || (det.count === 0 && this.embBusy);
+              if (isBlind) { blind = isBlind; body.blind = true; }
               body.faces = det.count;
               body.ms = this.diag.ms;
               if (det.descs && det.descs.length) body.descs = det.descs;

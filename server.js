@@ -982,7 +982,12 @@ class FaceFallback {
     maybeStart(fallbackNoCam) {
         if (config.serverFace === false) return;
         if (fallbackNoCam) return;                 // machine without a camera at all
-        if (this.active || this.starting) return;
+        // `this.proc` counts as "already running": between spawn() and the
+        // first frame `active` is still false, and without this check every
+        // beat in that window spawned ANOTHER ffmpeg — only the last one was
+        // ever referenced, so all the others leaked and kept the camera
+        // locked long after the fallback had "stopped".
+        if (this.active || this.starting || this.proc) return;
         if (Date.now() < this.retryAt) return;
         this.start().catch(() => {});
     }
@@ -1020,29 +1025,55 @@ class FaceFallback {
             const args = ['-hide_banner', '-loglevel', 'error',
                 '-f', 'dshow', '-rtbufsize', '64M', '-i', `video=${this.camera}`,
                 '-vf', 'fps=4,scale=320x240', '-pix_fmt', 'rgb24',
+                // Hard lifetime cap: if every other guard fails, the device is
+                // released by ffmpeg itself instead of staying locked forever.
+                // Long enough that normal handoffs never restart mid-session.
+                '-t', '180',
                 '-an', '-sn', '-f', 'rawvideo', 'pipe:1'];
             const proc = spawn('ffmpeg', args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
             this.proc = proc;
             this.buf = null;
             let opened = false;
+            // ffmpeg explains WHY it failed on stderr ("Could not run graph —
+            // device already in use" vs "Could not find video device"). Keep
+            // the last line: without it every failure looked identical and
+            // "busy" was a guess that cost hours.
+            let stderrTail = '';
             proc.once('close', (code) => {
-                // A non-zero exit before a single frame means the device could
-                // not be opened — almost always "busy: the (frozen) page still
-                // holds it". Back off instead of hammering DirectShow.
                 if (!opened) {
-                    this.err = `camera open failed (exit ${code}) — device busy or gone`;
+                    const busy = /already in use|Could not run graph/i.test(stderrTail);
+                    const gone = /Could not find video device|No such device/i.test(stderrTail);
+                    this.err = busy
+                        ? 'camera busy — another app (or a frozen page) holds the device'
+                        : gone
+                            ? `camera device not found (${this.camera})`
+                            : `camera open failed (exit ${code})${stderrTail ? ': ' + stderrTail.slice(0, 120) : ''}`;
                     this.retryAt = Date.now() + 10000;
                     this.active = false;
-                    this.proc = null;
+                    // Only clear the reference if it is still OURS: a late
+                    // close event from an older process must not orphan the
+                    // one that is actually running.
+                    if (this.proc === proc) this.proc = null;
+                    // One line per failing attempt is enough to prove the
+                    // state; the reason itself is on every line now.
                     console.log('[FaceFallback] ' + this.err);
                 } else if (this.active) {
                     this.err = 'capture stream ended';
                     this.active = false;
-                    this.proc = null;
+                    if (this.proc === proc) this.proc = null;
                     this.stopReason = 'stream-ended';
                 }
             });
-            proc.stderr.on('data', () => { /* errors surface via close code */ });
+            proc.once('error', (e) => {
+                this.err = 'spawn failed: ' + String(e?.message || e).slice(0, 120);
+                this.retryAt = Date.now() + 10000;
+                this.active = false;
+                if (this.proc === proc) this.proc = null;
+                console.log('[FaceFallback] ' + this.err);
+            });
+            proc.stderr.on('data', (d) => {
+                stderrTail = (stderrTail + d.toString()).slice(-400);
+            });
             proc.stdout.on('data', (chunk) => {
                 opened = true;
                 if (!this.active) { this.active = true; this.startedAt = Date.now(); this.err = null;
@@ -1094,15 +1125,31 @@ class FaceFallback {
         const was = this.active;
         this.active = false;
         if (this._fakeTimer) { clearInterval(this._fakeTimer); this._fakeTimer = null; }
-        if (this.proc) {
-            try { this.proc.kill(); } catch { /* already gone */ }
-            this.proc = null;
-        }
+        this._killProc();
         this.buf = null;
         this.faces = null;
         if (was) {
             this.stopReason = reason || 'stopped';
             console.log('[FaceFallback] stopped (' + this.stopReason + ')');
+        }
+    }
+
+    // Kill the capture process for real. A surviving ffmpeg is the worst
+    // failure mode in this design: it holds the DirectShow device, so neither
+    // the page nor the next fallback attempt can open a camera ever again.
+    // Node's kill() only signals the direct child, so follow it with a hard
+    // tree-kill — cheap, and it turns a permanently locked camera into a
+    // 150ms hiccup.
+    _killProc() {
+        const proc = this.proc;
+        this.proc = null;
+        if (!proc) return;
+        const pid = proc.pid;
+        try { proc.kill(); } catch { /* already gone */ }
+        if (pid) {
+            const t = spawn('taskkill', ['/PID', String(pid), '/T', '/F'],
+                { windowsHide: true, stdio: 'ignore' });
+            try { t.unref(); } catch { /* noop */ }
         }
     }
 
@@ -1461,10 +1508,18 @@ class PresenceEngine {
         // cam === 'idle' is the client's OWN statement that its sampling loop is
         // stopped — no picture, nothing to judge by, so stand down for that beat
         // instead of believing the last face count that happened to arrive.
+        //
+        // cam === 'handoff' is the same situation for a different reason: the
+        // page released the camera on purpose and CANNOT produce a face count
+        // any more. Its last numeric count is stale — treating it as evidence
+        // kept a handed-off page "seeing" a face forever (screen never blanked
+        // even with nobody in the room). The server-side capture, when it is
+        // running, has already returned above; when it is not, there is no
+        // picture and no evidence.
         const numericSilent = !this.lastNumericFaceAt ||
             (now - this.lastNumericFaceAt) > Math.max((this.hbIntervalMs || 350) * 4, 1500);
         const noPicture = !fallback && (cam === 'error' || cam === 'novideo' || cam === 'idle' ||
-            det === 'missing' || numericSilent);
+            cam === 'handoff' || det === 'missing' || numericSilent);
         if (noPicture) {
             if (this.noPictureSince == null) this.noPictureSince = now;
             const deadFor = now - this.noPictureSince;
@@ -1472,6 +1527,34 @@ class PresenceEngine {
             this.presentSince = null;
             this.absentStreakStart = now;
             this.keyHeldSince = null;
+            // ── Handoff we could not take over ────────────────────────────
+            // The page released the camera for us, but our own capture could
+            // not open it (device still busy, driver hiccup). There is no
+            // picture — yet the person is very likely sitting right here.
+            // The no-picture timer is the WRONG rule in this case: it blanks
+            // after noPictureBlankMs and did exactly that while the user was
+            // reading. The only honest sensor left is keyboard/mouse idle,
+            // judged with the same (deliberately conservative) threshold the
+            // page-lost mode uses.
+            if (cam === 'handoff') {
+                const idleSec = this.input ? this.input.getIdleSeconds() : null;
+                const blindAwaySec = this.fallback
+                    ? Math.max(parseFloat(cfg.noCamIdleSec) || 300, 5)
+                    : Math.max(parseFloat(cfg.blindAwaySec) || 10, 0.5);
+                if (!this.screen.isBlack && idleSec != null &&
+                    idleSec >= blindAwaySec && this.firstHeartbeatAt) {
+                    console.log(`[Presence] Camera handed off but still busy — input idle ` +
+                        `${Math.round(idleSec * 1000)}ms >= ${Math.round(blindAwaySec * 1000)}ms — blanking`);
+                    cfg.isScreenBlack = !(await this._blank());
+                    this.reason = 'blind-away';
+                    this.actionTaken = true;
+                } else if (this.screen.isBlack && (idleSec == null || idleSec < 2)) {
+                    console.log('[Presence] Input resumed — restoring screen (server camera unavailable)');
+                    cfg.isScreenBlack = !(await this._wake());
+                    this.reason = 'watchdog';
+                }
+                return;
+            }
             if (this.screen.isBlack) {
                 // Black + no picture: short outages (camera re-open churn, a
                 // 2-3s inference blind window) keep waiting. A camera that has
@@ -2082,7 +2165,10 @@ class BioRecognizeBackend {
             detErr: data.detErr || null,
             err: data.err || null,
             ms: typeof data.ms === 'number' ? data.ms : null,
-            faces: typeof data.faces === 'number' ? data.faces : null,
+            // A handed-off page cannot measure faces any more — whatever number
+            // it last sent is history, not evidence. Report null so /presence
+            // never shows a "1" for a camera nobody is looking at.
+            faces: data.handoff ? null : (typeof data.faces === 'number' ? data.faces : null),
             emb: data.emb || null,
             embMs: typeof data.embMs === 'number' ? data.embMs : null,
             migrate: data.migrate || null,
