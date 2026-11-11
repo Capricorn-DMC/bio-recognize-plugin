@@ -1772,6 +1772,7 @@ class BioRecognizeBackend {
         this.presence.clientDiag = {
             cam: data.cam || null,
             det: data.det || null,
+            detErr: data.detErr || null,
             err: data.err || null,
             ms: typeof data.ms === 'number' ? data.ms : null,
             faces: typeof data.faces === 'number' ? data.faces : null,

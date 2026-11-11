@@ -162,26 +162,69 @@
           const el = document.createElement('script');
           el.src = `${BACKEND_URL}${path}`;
           el.async = true;
+          // A host page with a strict script-src CSP never even opens the
+          // socket — onerror fires locally, and the tag error is the ONLY
+          // visible symptom. Second try: pull the text with fetch (CSP
+          // connect-src usually allows it) and evaluate a blob-URL script,
+          // which inherits this page's origin.
+          el.onerror = () => {
+            fetch(`${BACKEND_URL}${path}`).then(r => {
+              if (!r.ok) throw new Error(`HTTP ${r.status}`);
+              return r.text();
+            }).then(text => {
+              const url = URL.createObjectURL(new Blob([text], { type: 'text/javascript' }));
+              const el2 = document.createElement('script');
+              el2.src = url;
+              el2.onload = () => { URL.revokeObjectURL(url); resolve(); };
+              el2.onerror = () => { URL.revokeObjectURL(url); reject(new Error(`${path} blocked (CSP)`)); };
+              document.head.appendChild(el2);
+            }).catch(e => reject(new Error(`${path}: ${e?.message || e}`)));
+          };
           el.onload = () => resolve();
-          el.onerror = () => reject(new Error(`${path} load failed`));
           document.head.appendChild(el);
         });
       },
 
+      // fetch() with a hard timeout. An un-timed fetch that never settles
+      // used to wedge `_loadFaceDetector` forever: `picoLoading` stayed true,
+      // the 15s retry checked `!this.picoLoading` and never fired, and the
+      // client reported det:missing for the whole session with ZERO errors —
+      // the "everything looks healthy but nothing reacts" signature.
+      _fetchWithTimeout(url, ms = 10000) {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), ms);
+        return fetch(url, { signal: ctrl.signal }).finally(() => clearTimeout(t));
+      },
+
       async _loadFaceDetector() {
-        if (this.picoReady || this.picoLoading) return;
+        if (this.picoReady) return;
+        if (this.picoLoading) {
+          // Un-stick a load that hung: after 20s with no resolution, clear the
+          // flag so the beat-path retry can start a fresh attempt.
+          if (Date.now() - (this.picoLoadStarted || 0) > 20000) {
+            console.warn('[Heartbeat] detector load wedged for >20s — resetting');
+            this.picoLoading = false;
+          } else return;
+        }
         this.picoLoading = true;
+        this.picoLoadStarted = Date.now();
         try {
           await this._loadBackendScript('/pico.js');
           const pico = window.pico;
-          const buf = await (await fetch(`${BACKEND_URL}/facefinder`)).arrayBuffer();
+          if (!pico) throw new Error('pico global missing after script load');
+          const res = await this._fetchWithTimeout(`${BACKEND_URL}/facefinder`);
+          if (!res.ok) throw new Error(`facefinder HTTP ${res.status}`);
+          const buf = await res.arrayBuffer();
           this.classifyRegion = pico.unpack_cascade(new Int8Array(buf));
           this.pico = pico;
           this.picoReady = true;
+          this.diag.detErr = null;
         } catch (e) {
           // Detector is optional: without it, presence falls back to
-          // keyboard/mouse activity only.
-          console.warn('[Heartbeat] face detector unavailable:', e?.message);
+          // keyboard/mouse activity only. But make the reason visible in the
+          // heartbeat — a silent 'det: missing' cost days of debugging.
+          this.diag.detErr = String(e?.message || e).slice(0, 160);
+          console.warn('[Heartbeat] face detector unavailable:', this.diag.detErr);
         } finally {
           this.picoLoading = false;
         }
@@ -824,7 +867,7 @@
           this.beatWorker = w;
           // Visible marker so it is obvious from DevTools which build is live
           // (dsh serves the client bundle from memory captured at startup).
-          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261111c)');
+          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261111d)');
         } catch {
           // Worker construction blocked (strict CSP etc.) — old behaviour.
           this.timer = setInterval(() => { this._beat(); this._watchdogTick(); }, this.intervalMs);
@@ -1053,6 +1096,11 @@
             this._loadFaceDetector();
           }
           const body = { cam: this.diag.cam, det: this.picoReady ? 'ok' : 'missing' };
+          // Why the detector is missing, in the page's own words — the
+          // difference between "script blocked by host CSP" and "backend
+          // not reachable" and "load hung" used to be invisible from
+          // outside the browser.
+          if (!this.picoReady && this.diag.detErr) body.detErr = this.diag.detErr;
           // Loop health: without this, "no beats arrived" is indistinguishable
           // between a frozen tab, a throttled timer and a released token.
           body.clock = this.beatWorker ? 'worker' : (this.timer ? 'timer' : 'none');
