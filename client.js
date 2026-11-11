@@ -110,6 +110,7 @@
       beatWorker: null,    // Worker-driven beat clock (immune to page throttling)
       retryTimer: null,
       supervisor: null,    // guarantees a beat keeps flowing no matter what
+      reviver: null,       // intent-vs-reality reconciler (never torn down)
       watchdog: null,      // camera liveness watchdog (frames stopped arriving)
       noFrameSince: null,  // first time we saw videoWidth === 0 while running
       recoverAt: 0,        // rate-limit for camera re-open
@@ -536,11 +537,106 @@
           // fails to open (busy device, permission prompt, hung getUserMedia)
           // used to leave the client with no timer at all, so not a single
           // heartbeat was sent and the server declared the client dead.
-          this._ensureBeatTimer();
-          this._startSupervisor();
+          try {
+            this._ensureBeatTimer();
+            this._startSupervisor();
+            this._startReviver();
+            this._keepAudible(true);
+          } catch (e) {
+            // A throw here used to abort acquire() halfway: `running` was
+            // already true but no clock existed, and because setIntent() had
+            // set the flag before calling us, every later setIntent(true)
+            // returned early — the loop stayed dead for the life of the page.
+            this.diag.err = 'acquire: ' + String(e?.message || e).slice(0, 140);
+            console.warn('[Heartbeat] could not start the beat clock:', e?.message || e);
+          }
           this._openCamera();
         }
         return token;
+      },
+
+      // ── Freeze exemption ─────────────────────────────────────────────────
+      // Chromium SUSPENDS a hidden page: timers, Web Workers, fetch callbacks —
+      // everything, not merely throttled. Field evidence: `vis:hidden` in the
+      // beat, then 101 seconds of total silence with clock=worker and tok=2
+      // still reported in the last beat. A frozen page cannot send a beat, and
+      // it cannot even notice that it stopped, so no amount of in-page
+      // self-healing (worker watchdog, reviver) can rescue it — the whole point
+      // of those guards is lost the moment the renderer itself is parked.
+      //
+      // A page that is PLAYING AUDIO is exempt from freezing. An oscillator at
+      // a gain far below the audible threshold keeps a live audio stream on the
+      // tab without making a sound: the renderer keeps running while the window
+      // is hidden or minimised, which is exactly when "I walked away and the
+      // screen should go black" happens. Chromium shows the tab's audio
+      // indicator; that is the visible cost of the feature working at all.
+      _keepAudible(on) {
+        try {
+          const AC = (typeof window !== 'undefined') && (window.AudioContext || window.webkitAudioContext);
+          if (!on) {
+            if (this._ac) { try { this._ac.close(); } catch { /* noop */ } this._ac = null; }
+            return;
+          }
+          if (this._ac) {
+            if (this._ac.state === 'suspended') { try { this._ac.resume().catch(() => {}); } catch { /* noop */ } }
+            return;
+          }
+          if (!AC) return;
+          const ac = new AC();
+          const osc = ac.createOscillator();
+          const gain = ac.createGain();
+          // 0 would be "not audible" again; this is ~-62 dB, inaudible on any
+          // speaker yet a real, non-silent stream for the browser.
+          gain.gain.value = 0.0008;
+          osc.frequency.value = 120;
+          osc.connect(gain);
+          gain.connect(ac.destination);
+          osc.start();
+          this._ac = ac;
+          if (ac.state === 'suspended') { try { ac.resume().catch(() => {}); } catch { /* noop */ } }
+        } catch { /* audio is best-effort: never let it break the loop */ }
+      },
+
+      // Last resort, and the invariant that makes this whole class of bug
+      // harmless: THE INTENT IS THE TRUTH. If the config says "detect", then a
+      // loop that is not running is a bug, wherever it came from — a component
+      // that released one token too many, a setIntent(false) fired by a render
+      // that had not loaded the config yet, a _stop() from a page that then
+      // stayed open. Every 2s this reconciles reality with the intent instead
+      // of trusting a flag: no token → put one back; not running → start it.
+      //
+      // It runs on its own worker clock and is never torn down (not by _stop()
+      // either) because the failure it exists for is "every clock is gone".
+      _startReviver() {
+        if (this.reviver) return;
+        try {
+          const src = 'let h=null;onmessage=(e)=>{const d=e.data||{};' +
+            'if(d.cmd==="start"){if(h)clearInterval(h);h=setInterval(()=>postMessage(1),d.ms);}' +
+            'else if(d.cmd==="stop"){if(h){clearInterval(h);h=null;}}};';
+          const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+          const w = new Worker(url);
+          URL.revokeObjectURL(url);
+          w.onmessage = () => this._reviveCheck();
+          w.postMessage({ cmd: 'start', ms: 2000 });
+          this.reviver = w;
+        } catch {
+          this.reviver = setInterval(() => this._reviveCheck(), 2000);
+        }
+      },
+
+      _reviveCheck() {
+        if (!this.intent) return;
+        if (!this.intentToken || !this.tokens.has(this.intentToken)) {
+          console.warn('[Heartbeat] intent lost its token — re-acquiring');
+          this.diag.revived = (this.diag.revived || 0) + 1;
+          try { this.intentToken = this.acquire(300); } catch { /* next tick */ }
+          return;
+        }
+        if (!this.running) {
+          console.warn('[Heartbeat] loop was stopped while the intent is on — restarting');
+          this.diag.revived = (this.diag.revived || 0) + 1;
+          try { this.acquire(300); } catch { /* next tick */ }
+        }
       },
 
       // Background/hidden windows get their timers throttled or frozen by the
@@ -615,15 +711,32 @@
       // when the user actually turns detection off.
       setIntent(on) {
         const next = !!on;
-        if (next === this.intent) return;
+        if (next === this.intent) {
+          // The flag can outlive its token (an acquire() that threw halfway, a
+          // component that released the wrong one). Trusting the flag meant a
+          // single early return kept the loop dead forever: setIntent(true)
+          // was called on every render and did nothing. Repair instead.
+          if (next && (!this.intentToken || !this.tokens.has(this.intentToken))) {
+            try { this.intentToken = this.acquire(300); } catch { /* reviver retries */ }
+          }
+          return;
+        }
         this.intent = next;
         if (next) {
-          if (!this.intentToken) this.intentToken = this.acquire(300);
+          this._startReviver();
+          if (!this.intentToken) {
+            try { this.intentToken = this.acquire(300); } catch { /* reviver retries */ }
+          }
         } else if (this.intentToken) {
           const t = this.intentToken;
           this.intentToken = null;
           if (this._idleStopTimer) { clearTimeout(this._idleStopTimer); this._idleStopTimer = null; }
           this.tokens.delete(t);
+          // The user actually turned detection off: release the freeze
+          // exemption too. It is deliberately NOT released in _stop(), because
+          // an accidental stop while hidden would then freeze the page and the
+          // reviver would never get to run.
+          if (!this.tokens.size) this._keepAudible(false);
           if (this.tokens.size) this._applyInterval();
           else this._stop();
         }
@@ -687,7 +800,7 @@
           this.beatWorker = w;
           // Visible marker so it is obvious from DevTools which build is live
           // (dsh serves the client bundle from memory captured at startup).
-          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261111a)');
+          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261111b)');
         } catch {
           // Worker construction blocked (strict CSP etc.) — old behaviour.
           this.timer = setInterval(() => { this._beat(); this._watchdogTick(); }, this.intervalMs);
@@ -926,6 +1039,10 @@
           // climbs while beats stop, the loop was buried by foreign code, not
           // broken by us. Cheap, and it ends the guessing.
           if (this.rejCount) body.rj = this.rejCount;
+          // How many times the intent-vs-reality check had to put the loop back
+          // together. Non-zero means something DID stop it — the number makes
+          // that visible in /presence instead of silently self-healing.
+          if (this.diag.revived) body.rev = this.diag.revived;
           // Tell the server this machine has NO camera device at all — the only
           // statement that may engage its input-idle fallback mode.
           if (this.noCam) body.nocam = true;
@@ -1321,6 +1438,14 @@
       // token, so closing this page or one failed poll can no longer shut the
       // camera down (see HeartbeatMgr.setIntent).
       React.useEffect(() => {
+        // A render with an EMPTY config is not the user's opinion. The initial
+        // state is {}, so this effect used to fire setIntent(false) the moment
+        // the settings page mounted — which stopped a perfectly healthy loop
+        // (camera closed, clock destroyed) and only restarted it if the config
+        // fetch happened to succeed afterwards. If that fetch failed, nothing
+        // ever turned the intent back on and detection stayed dead for the life
+        // of the page while the UI still read "检测中" from the server.
+        if (config.enabled === undefined || config.faceEnabled === undefined) return;
         HeartbeatMgr.setIntent(!!(config.enabled && config.faceEnabled));
       }, [config.enabled, config.faceEnabled]);
 

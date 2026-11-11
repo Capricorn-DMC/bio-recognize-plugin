@@ -1700,7 +1700,14 @@ class BioRecognizeBackend {
             this.presence.faceStreak = 0;
             this.presence.actionTaken = false;
             if (beatGap > 3000) {
-                console.log(`[Presence] Heartbeat resumed after ${Math.round(beatGap)}ms — settling`);
+                // Forensic line for "it stopped reacting". The client now runs
+                // its beat on a Worker clock plus a 2s watchdog, so a gap this
+                // long cannot come from a broken timer inside the page: either
+                // the page was not executing at all (hidden/frozen window,
+                // closed tab, sleeping machine) or no component held the loop.
+                // `tok`/`clock` in the payload say which.
+                console.log(`[Presence] Heartbeat resumed after ${Math.round(beatGap)}ms — settling` +
+                    ` (clock=${data.clock || '?'}, tok=${data.tok ?? '?'}, vis=${data.vis || '?'}, rj=${data.rj ?? '?'})`);
             }
         }
         // Measure the real sampling cadence (EMA). Everything that waits on
@@ -1740,6 +1747,9 @@ class BioRecognizeBackend {
             // climbing while beats also stop means foreign code buried the
             // main thread — a different problem from "our loop died".
             rj: typeof data.rj === 'number' ? data.rj : null,
+            // Times the page had to restart a stopped loop. Non-zero proves
+            // something stopped it and the guard caught it.
+            rev: typeof data.rev === 'number' ? data.rev : null,
             at: now,
         };
         // Latch the "no camera device exists" statement: on while the client
