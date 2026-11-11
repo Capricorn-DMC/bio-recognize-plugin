@@ -153,6 +153,14 @@ let config = {
     // who want face-like latency while the page is dead can dial it to
     // 0.5s and pay the false-blank cost knowingly.
     blindAwaySec: 10,
+    // ── Server-side face fallback ───────────────────────────────────────
+    // When the page hands the camera over (hidden/dead), THIS process grabs
+    // it with ffmpeg and runs the same pico detector. Presence, not identity.
+    serverFace: true,
+    // No face for this long (seconds) while the fallback owns the camera →
+    // blank; a face while black → wake. The face channel is allowed to be
+    // trigger-happy: it can actually see the person.
+    serverFaceAwaySec: 3,
     // ── Identity (1:N face matching) ───────────────────────────────────
     // identityCheck: a detected face only counts if it matches an enrolled
     // person. This is what makes the screen "only mine" instead of "anybody
@@ -899,6 +907,236 @@ class IdentityMatcher {
 // Presence Detection Engine
 // ============================================================
 
+// ── Server-side face fallback ──────────────────────────────────────────────
+// The page's face channel dies whenever the dsh webview is frozen by its
+// host — every in-page guard shares that death. This class is the answer
+// that does NOT live in the page: it grabs the webcam itself through ffmpeg
+// and runs the SAME pico cascade in THIS Node process (pure JS, no browser
+// involved). Ownership protocol with the page:
+//   • page visible            → page owns the camera; this class idle.
+//   • page hidden (handoff)   → page releases the device and says so in its
+//                               beat (`vis:hidden` + `handoff`); we start
+//                               capturing and own presence until the page
+//                               reports `vis:visible` again.
+//   • page dead w/o handoff   → we try to start anyway; if the frozen page
+//                               still holds the device the open fails and we
+//                               retry every 10s, meanwhile input-idle rules
+//                               (blind-away) stay in charge.
+// Identity is NOT judged here — presence only. That is enough for both
+// directions the user cares about: no face for N seconds → blank, face
+// while black → wake.
+class FaceFallback {
+    constructor() {
+        this.ready = false;        // pico + cascade loaded (skipped in fake mode)
+        this.active = false;       // capturing frames right now
+        this.starting = false;
+        this.startedAt = 0;
+        this.faces = null;         // face count in the last readable frame
+        this.lastFaceAt = 0;       // ms timestamp of the last frame WITH a face
+        this.lastFrameAt = 0;      // last frame of ANY kind (freshness probe)
+        this.err = null;
+        this.stopReason = null;
+        this.retryAt = 0;          // do not retry a busy camera before this
+        this.camera = null;        // DirectShow device name in use
+        this.proc = null;
+        this.buf = null;
+        this.pico = null;
+        this.cascade = null;
+        this._fakeTimer = null;
+    }
+
+    // Lazy init: the cascade load costs a few ms and is pointless when the
+    // page is healthy, so it happens on first use, not at boot.
+    _ensureInit() {
+        if (this.ready || this.initErr) return;
+        try {
+            const src = readFileSync(join(__dirname, 'vendor', 'pico.js'), 'utf8');
+            const ctx = { Math, console, Float32Array, Int8Array, Uint8Array,
+                DataView, ArrayBuffer, Array, Object, Infinity, NaN };
+            vm.createContext(ctx);
+            vm.runInContext(src, ctx);
+            if (!ctx.pico || !ctx.pico.run_cascade) throw new Error('pico.js did not expose pico');
+            this.pico = ctx.pico;
+            const buf = readFileSync(join(__dirname, 'vendor', 'facefinder'));
+            this.cascade = this.pico.unpack_cascade(new Int8Array(buf));
+            this.ready = true;
+        } catch (e) {
+            this.initErr = String(e?.message || e).slice(0, 200);
+            this.err = 'init: ' + this.initErr;
+        }
+    }
+
+    _findCamera() {
+        // Explicit config wins; otherwise the first DirectShow video device.
+        const forced = config.serverFaceCamera;
+        if (forced) return String(forced);
+        try {
+            const out = execFileSync('ffmpeg', ['-hide_banner', '-list_devices', 'true',
+                '-f', 'dshow', '-i', 'dummy'], { encoding: 'utf8', timeout: 15000 });
+            return null; // ffmpeg writes devices to stderr; encoding keeps it in out only on some builds
+        } catch (e) {
+            // ffmpeg exits non-zero for -list_devices; the device list is on stderr.
+            const text = String(e?.stderr || '');
+            const m = text.match(/"([^"]+)"\s+\(video\)/);
+            return m ? m[1] : null;
+        }
+    }
+
+    maybeStart(fallbackNoCam) {
+        if (config.serverFace === false) return;
+        if (fallbackNoCam) return;                 // machine without a camera at all
+        if (this.active || this.starting) return;
+        if (Date.now() < this.retryAt) return;
+        this.start().catch(() => {});
+    }
+
+    async start() {
+        if (this.active || this.starting) return;
+        this.starting = true;
+        this.stopReason = null;
+        try {
+            // Test hook: pretend the camera sees (or does not see) a face.
+            const fake = process.env.BIO_TEST_FACE_MODE;
+            if (fake) {
+                this.ready = true;
+                this.active = true;
+                this.startedAt = Date.now();
+                this.err = null;
+                this._fakeTimer = setInterval(() => {
+                    const now = Date.now();
+                    this.lastFrameAt = now;
+                    const present = fake === 'present';
+                    this.faces = present ? 1 : 0;
+                    if (present) this.lastFaceAt = now;
+                }, 250);
+                console.log('[FaceFallback] FAKE capture started (mode=' + fake + ')');
+                return;
+            }
+            this._ensureInit();
+            if (!this.ready) { this.retryAt = Date.now() + 30000; return; }
+            if (!this.camera) this.camera = this._findCamera();
+            if (!this.camera) {
+                this.err = 'no camera device found';
+                this.retryAt = Date.now() + 30000;
+                return;
+            }
+            const args = ['-hide_banner', '-loglevel', 'error',
+                '-f', 'dshow', '-rtbufsize', '64M', '-i', `video=${this.camera}`,
+                '-vf', 'fps=4,scale=320x240', '-pix_fmt', 'rgb24',
+                '-an', '-sn', '-f', 'rawvideo', 'pipe:1'];
+            const proc = spawn('ffmpeg', args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+            this.proc = proc;
+            this.buf = null;
+            let opened = false;
+            proc.once('close', (code) => {
+                // A non-zero exit before a single frame means the device could
+                // not be opened — almost always "busy: the (frozen) page still
+                // holds it". Back off instead of hammering DirectShow.
+                if (!opened) {
+                    this.err = `camera open failed (exit ${code}) — device busy or gone`;
+                    this.retryAt = Date.now() + 10000;
+                    this.active = false;
+                    this.proc = null;
+                    console.log('[FaceFallback] ' + this.err);
+                } else if (this.active) {
+                    this.err = 'capture stream ended';
+                    this.active = false;
+                    this.proc = null;
+                    this.stopReason = 'stream-ended';
+                }
+            });
+            proc.stderr.on('data', () => { /* errors surface via close code */ });
+            proc.stdout.on('data', (chunk) => {
+                opened = true;
+                if (!this.active) { this.active = true; this.startedAt = Date.now(); this.err = null;
+                    console.log('[FaceFallback] capturing ' + this.camera); }
+                this.lastFrameAt = Date.now();
+                // rgb24 → fixed-size frames; keep only the freshest complete
+                // one so a slow tick never builds a backlog of stale faces.
+                const FSZ = 320 * 240 * 3;
+                this.buf = this.buf ? Buffer.concat([this.buf, chunk]) : chunk;
+                if (this.buf.length > FSZ * 3) this.buf = this.buf.subarray(this.buf.length - FSZ * 2);
+                if (this.buf.length >= FSZ) {
+                    const lastStart = this.buf.length - (this.buf.length % FSZ) - FSZ;
+                    const f = this.buf.subarray(lastStart, lastStart + FSZ);
+                    this.buf = this.buf.subarray(lastStart + FSZ);   // incomplete tail only
+                    this._detect(f);
+                }
+            });
+        } finally {
+            this.starting = false;
+        }
+    }
+
+    // Same pipeline as the page: rgb24 → weighted luma → pico → cluster ≥5.0.
+    // An unreadable (all-black/all-white) frame is NO evidence at all: the
+    // hold window rides it out instead of concluding "walked away".
+    _detect(frame) {
+        if (!this.ready) return;
+        try {
+            const gray = new Uint8Array(320 * 240);
+            for (let i = 0, p = 0; i < gray.length; ++i, p += 3)
+                gray[i] = (2 * frame[p] + 7 * frame[p + 1] + frame[p + 2]) / 10;
+            let s = 0, n = 0;
+            for (let i = 0; i < gray.length; i += 97) { s += gray[i]; n++; }
+            const mean = s / n;
+            if (mean < 6 || mean > 252) return;
+            const dts = this.pico.run_cascade(
+                { pixels: gray, nrows: 240, ncols: 320, ldim: 320 },
+                this.cascade,
+                { shiftfactor: 0.12, minsize: 29, maxsize: 180, scalefactor: 1.2 });
+            const dets = this.pico.cluster_detections(dts, 0.1).filter(d => d[3] >= 5.0);
+            this.faces = dets.length;
+            if (dets.length) this.lastFaceAt = Date.now();
+        } catch (e) {
+            this.err = 'detect: ' + String(e?.message || e).slice(0, 160);
+        }
+    }
+
+    stop(reason) {
+        const was = this.active;
+        this.active = false;
+        if (this._fakeTimer) { clearInterval(this._fakeTimer); this._fakeTimer = null; }
+        if (this.proc) {
+            try { this.proc.kill(); } catch { /* already gone */ }
+            this.proc = null;
+        }
+        this.buf = null;
+        this.faces = null;
+        if (was) {
+            this.stopReason = reason || 'stopped';
+            console.log('[FaceFallback] stopped (' + this.stopReason + ')');
+        }
+    }
+
+    framesFresh(now) { return now - this.lastFrameAt < 5000; }
+    present(now) { return this.lastFaceAt > 0 && now - this.lastFaceAt < 2500; }
+
+    onBeat(data) {
+        if (!data) return;
+        if (data.vis === 'visible') {
+            if (this.active) this.stop('client-visible');
+        } else if (data.handoff) {
+            // The page has released the camera on purpose — take over now,
+            // do not wait for the beats to die.
+            this.maybeStart(false);
+        }
+    }
+
+    status(now) {
+        return {
+            active: this.active,
+            ready: this.ready,
+            faces: this.faces,
+            frameAgeMs: this.lastFrameAt ? now - this.lastFrameAt : null,
+            faceAgeMs: this.lastFaceAt ? now - this.lastFaceAt : null,
+            camera: this.camera,
+            err: this.err,
+            stopReason: this.stopReason,
+        };
+    }
+}
+
 class PresenceEngine {
     constructor(inputMonitor, identity = null) {
         this.screen = new ScreenController();
@@ -939,6 +1177,11 @@ class PresenceEngine {
 
         this.keepAlive = new KeepAlive();
         this.createdAt = Date.now();   // startup settle window (see checkPresence)
+
+        // Server-side face fallback: owns presence whenever the page gave up
+        // the camera (handoff) or died. See class FaceFallback.
+        this.faceFallback = new FaceFallback();
+        this.serverFaceAbsentSince = null; // start of the current no-face episode
     }
 
     async startDetection(cfg) {
@@ -1064,8 +1307,43 @@ class PresenceEngine {
         return true;
     }
 
+    // Presence decisions while OUR capture owns the camera. Same philosophy
+    // as the page path, minus the identity check (presence only): a face
+    // seen within the hold window = someone is there; nothing for awayMs =
+    // nobody is. The hold window (2.5s ≈ 10 frames at 4fps) rides out pico
+    // flicker so a single missed frame never blanks on a present user.
+    async _tickServerFace(cfg, now) {
+        const ff = this.faceFallback;
+        if (!cfg.enabled) { ff.stop('disabled'); return; }
+        const present = ff.present(now);
+        this.state = present ? 'present' : 'absent';
+        const awayMs = Math.max(parseFloat(cfg.serverFaceAwaySec) || 3, 1) * 1000;
+        if (present) {
+            this.serverFaceAbsentSince = null;
+        } else if (this.serverFaceAbsentSince == null) {
+            // Absence counts from the capture start too: a camera that never
+            // saw a face is not an excuse to wait forever.
+            this.serverFaceAbsentSince = Math.max(now, ff.startedAt);
+        }
+        if (!this.screen.isBlack) {
+            if (this.firstHeartbeatAt && this.serverFaceAbsentSince != null &&
+                now - this.serverFaceAbsentSince >= awayMs) {
+                console.log(`[Presence] Server-side camera: no face for ` +
+                    `${Math.round((now - this.serverFaceAbsentSince) / 1000)}s — blanking (server-face-away)`);
+                cfg.isScreenBlack = !(await this._blank());
+                this.reason = 'server-face-away';
+                this.actionTaken = true;
+            }
+        } else if (present) {
+            console.log('[Presence] Server-side camera: face appeared — restoring screen');
+            cfg.isScreenBlack = !(await this._wake());
+            this.reason = 'server-face-back';
+            this.serverFaceAbsentSince = null;
+        }
+    }
+
     async checkPresence(cfg) {
-        if (!cfg.enabled) return;
+        if (!cfg.enabled) { this.faceFallback.stop('disabled'); return; }
         const now = Date.now();
 
         // ── 0. Watcher liveness ───────────────────────────────────────
@@ -1110,7 +1388,21 @@ class PresenceEngine {
             const blindAwaySec = this.fallback
                 ? Math.max(parseFloat(cfg.noCamIdleSec) || 300, 5)
                 : Math.max(parseFloat(cfg.blindAwaySec) || 10, 0.5);
+            // Face-fallback decisions and input decisions share the same fast
+            // gate (~1.5s): the sensitive face path reacts in ~2s once frames
+            // flow, and while the camera is busy/unavailable the input rules
+            // keep their established latency.
             if (hbAge > blindGapMs) {
+                // Take the camera over ourselves. If the page handed it off,
+                // this succeeds and the face rules below react in ~2s — the
+                // same latency as the page path. If the frozen page still
+                // holds the device, this backs off for 10s and the input
+                // rules carry the load meanwhile.
+                this.faceFallback.maybeStart(this.fallback);
+                if (this.faceFallback.active && this.faceFallback.framesFresh(now)) {
+                    await this._tickServerFace(cfg, now);
+                    return;
+                }
                 if (!this.screen.isBlack && idleSec != null &&
                     idleSec >= blindAwaySec && this.firstHeartbeatAt) {
                     console.log(`[Presence] Client silent ${Math.round(hbAge)}ms + input idle ` +
@@ -1130,6 +1422,20 @@ class PresenceEngine {
                 }
             }
             return;
+        }
+
+        // ── 0a-bis. Server-side face ownership ────────────────────────────
+        // The page handed the camera over (handoff on hide) and may itself be
+        // frozen any second. While our capture runs, WE are the face sensor:
+        // the page's faces (null — it released the device) must not be read
+        // as evidence here, so the whole client-driven logic below is skipped.
+        if (this.faceFallback.active) {
+            if (this.faceFallback.framesFresh(now)) {
+                await this._tickServerFace(cfg, now);
+                return;
+            }
+            // Capture died (device yanked, ffmpeg gone): back to the page.
+            this.faceFallback.stop('stale');
         }
 
         // ── 0b. Camera health ─────────────────────────────────────────
@@ -1814,6 +2120,11 @@ class BioRecognizeBackend {
             this.presence.firstHeartbeatAt = now;
             console.log('[Presence] Client checked in — presence actions armed');
         }
+        // Camera-ownership protocol: the page says what it did with the device.
+        // visible → it took the camera back (we must have released it already);
+        // hidden+handoff → it released the device for us, take over NOW instead
+        // of waiting for the beats to stop.
+        this.presence.faceFallback.onBeat(data);
 
         // Face count: `null`/absent means the detector did not run this frame
         // (still loading, camera hiccup). Only a real number marks the
@@ -1988,6 +2299,10 @@ class BioRecognizeBackend {
         if (data.blindAwaySec !== undefined) {
             config.blindAwaySec = Math.min(Math.max(parseFloat(data.blindAwaySec) || 10, 0.5), 600);
         }
+        if (data.serverFace !== undefined) config.serverFace = !!data.serverFace;
+        if (data.serverFaceAwaySec !== undefined) {
+            config.serverFaceAwaySec = Math.min(Math.max(parseFloat(data.serverFaceAwaySec) || 3, 1), 600);
+        }
 
         // Any judgement-rule change starts from a clean slate — stale streaks
         // from the previous rule would otherwise fire an action immediately.
@@ -2043,6 +2358,7 @@ class BioRecognizeBackend {
             // What the browser side thinks of its own camera — without this the
             // UI could only say "检测中" while the camera was in fact dead.
             client: this.presence.clientDiag || null,
+            faceFallback: this.presence.faceFallback.status(Date.now()),
             noCam: !!this.presence.noCam,
             fallbackActive: !!this.presence.fallback,
             blackForMs: this.presence.screen.blackSince ? Date.now() - this.presence.screen.blackSince : null,

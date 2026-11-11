@@ -120,6 +120,7 @@
       picoRetryAt: 0,      // next attempt to (re)load the face detector
       rejCount: 0,         // unhandled rejections seen on this page (diagnostic)
       noCam: false,        // no camera device exists at all (NotFoundError)
+      handoff: false,      // camera released on purpose while hidden (server owns it)
       lastBeatAt: 0,       // last completed beat (any outcome)
       diag: { cam: 'idle', err: null, ms: 0, beats: 0, lastBeatOk: null, emb: null, embErr: null, embMs: null, migrate: null, backend: null, warmMs: null },
       intervalMs: 350,
@@ -723,10 +724,48 @@
           this._ensureBeatTimer();
           this._beat();
         };
-        document.addEventListener('visibilitychange', () => { if (!document.hidden) wake(); });
+        document.addEventListener('visibilitychange', () => {
+          if (document.hidden) { this._handoffCamera(); wake(); }
+          else { wake(); this._resumeFromHandoff(); }
+        });
         window.addEventListener('focus', wake);
         window.addEventListener('pageshow', wake);
         this._hookRejections();
+      },
+
+      // ── Camera handoff ──────────────────────────────────────────────
+      // When this page goes to the background the host may freeze it at any
+      // moment — and a frozen page keeps holding the webcam, which blocks
+      // the server from doing the detection itself. So the page gives the
+      // device UP on hide and says so in its next beat (`handoff`): the
+      // server grabs the camera and keeps watching. On return to the
+      // foreground the page takes the device back after giving the server
+      // a beat to release it (its stop is near-instant; 1.2s is slack).
+      _handoffCamera() {
+        this.handoff = true;
+        try {
+          if (this.stream) {
+            this.stream.getTracks().forEach(t => { try { t.stop(); } catch { /* noop */ } });
+            this.stream = null;
+          }
+          if (this.video) { try { this.video.srcObject = null; } catch { /* noop */ } }
+          this.diag.cam = 'handoff';
+          this.noFrameSince = null;
+        } catch { /* best effort */ }
+      },
+
+      _resumeFromHandoff() {
+        if (!this.handoff) return;
+        this.handoff = false;
+        if (!this.running || !this.tokens.size) return;
+        // The next beats carry vis:visible; the server stops its capture on
+        // the first one. Wait a beat's worth of time, then reopen.
+        setTimeout(() => {
+          if (!document.hidden && this.running && !this.stream) {
+            console.info('[Heartbeat] resuming camera after handoff');
+            this._reopen();
+          }
+        }, 1200);
       },
 
       // Count unhandled rejections raised by anything on this page. They are
@@ -867,7 +906,7 @@
           this.beatWorker = w;
           // Visible marker so it is obvious from DevTools which build is live
           // (dsh serves the client bundle from memory captured at startup).
-          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261111e)');
+          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261111f)');
         } catch {
           // Worker construction blocked (strict CSP etc.) — old behaviour.
           this.timer = setInterval(() => { this._beat(); this._watchdogTick(); }, this.intervalMs);
@@ -1106,6 +1145,10 @@
           body.clock = this.beatWorker ? 'worker' : (this.timer ? 'timer' : 'none');
           body.vis = document.hidden ? 'hidden' : 'visible';
           body.tok = this.tokens.size;
+          // Camera-ownership protocol: this page has released the webcam on
+          // purpose (hidden) — the server should take the device over now,
+          // not wait for these beats to stop.
+          if (this.handoff) body.handoff = true;
           // Anti-freeze keepalive health. 'running' is the only state that
           // exempts the page from being frozen while hidden; a context stuck
           // in 'suspended' (autoplay policy, no user gesture yet) means the
@@ -1189,6 +1232,13 @@
       // hiccup — with no JS error at all: videoWidth stays 0 and the beats keep
       // saying cam:'ok' with no faces, so the server waits forever.
       _checkCamera(now) {
+        // During a handoff the camera was released ON PURPOSE — the device is
+        // not dead and must not be reopened until the page is visible again.
+        if (this.handoff) {
+          this.noFrameSince = null;
+          this.diag.cam = 'handoff';
+          return;
+        }
         try {
           const v = this.video;
           const alive = !!(v && v.videoWidth && v.readyState >= 2 &&
@@ -1776,6 +1826,19 @@
               min: 0.5, max: 600, step: 0.5, style: s.inputSmall,
             }),
             h('span', { style: { fontSize: 12, color: T.text2 } }, '秒键鼠空闲后熄屏（页面被后台冻结、无人脸信号时；太小会把“停下阅读”也判为离开）')
+          ),
+          // Server-side face fallback: when the page is hidden it hands the
+          // camera to the backend, which keeps watching with its own copy of
+          // the detector. This is how fast the backend blanks on "no face".
+          h('div', { style: { ...s.row, marginBottom: 0 } },
+            h('span', { style: s.label }, '后台熄屏（人脸）'),
+            h('input', {
+              type: 'number',
+              value: config.serverFaceAwaySec != null ? config.serverFaceAwaySec : 3,
+              onChange: e => upd('serverFaceAwaySec', Math.min(Math.max(parseFloat(e.target.value) || 3, 1), 600)),
+              min: 1, max: 600, step: 1, style: s.inputSmall,
+            }),
+            h('span', { style: { fontSize: 12, color: T.text2 } }, '秒无人脸后熄屏（dsh 在后台时后端直接用摄像头检测，与前台人脸路径同速）')
           )
         ),
 

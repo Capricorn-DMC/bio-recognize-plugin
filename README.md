@@ -67,6 +67,7 @@ bio-recognize-plugin/
 
 - **Client ↔ Host**：浏览器 UI 通过 DSH `/api` RPC 载体调用 Host 方法（`start`/`stop`/`status`），Host 用 `child_process` 管理 `server.js` 进程（detached + PID 文件，跨 DSH 重启可管理）。
 - **设备采集**：摄像头帧 → JPEG base64；话筒 PCM → 手动编码 16-bit WAV → base64；后端解码存 `models/captures/` 后走统一的特征提取管线（光谱 / 暗圆分析）。
+- **服务端人脸兜底**：页面切到后台时主动释放摄像头（handoff 协议），后端用 `ffmpeg`（DirectShow）抓帧并在 Node 里跑同一套 pico 级联检测器（`vm` 沙箱加载 `vendor/pico.js`）。页面被宿主冻结时人脸检测照常工作：无人脸 N 秒（`serverFaceAwaySec`，默认 3s）熄屏、黑屏时出现人脸即唤醒。仅判定"有没有人"，身份核验仍由页面负责。摄像头被冻结页面锁住时自动退回键鼠空闲兜底（`blindAwaySec`）。
 
 ## 安全注意
 
