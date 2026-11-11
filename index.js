@@ -527,7 +527,12 @@ export function apply(ctx, config) {
         }
       },
     });
-    ctx.effect?.(() => { /* registration handled by host */ });
+    // Plugin deactivation / uninstall: the backend is detached on purpose, so
+    // without an explicit cleanup here it outlives the plugin (the host just
+    // deletes the directory) and keeps dimming the screen on its own — the
+    // "uninstalled but the screen still goes dark" report. stopServer restores
+    // brightness BEFORE killing the tree, so the display is always left sane.
+    ctx.effect?.(() => () => { stopServer().catch(() => {}); });
 
   // Auto-start backend on plugin activation (fire-and-forget; UI can re-trigger)
   ensureServer().catch(() => {});

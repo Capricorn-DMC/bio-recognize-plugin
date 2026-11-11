@@ -118,14 +118,17 @@ $watch.add_Tick({
             if ($script:isShown) { $form.Hide(); $script:isShown = $false }
         } catch { }
         try {
-            $lvl = 70
+            # Restore ONLY what we actually recorded before blanking. No level
+            # file means this backend never dimmed anything — touching the
+            # brightness then would overwrite the user's own setting.
             $lvlFile = Join-Path $PSScriptRoot '_black_level.txt'
             if (Test-Path $lvlFile) {
-                $parsed = 0
-                if ([int]::TryParse((Get-Content $lvlFile -Raw).Trim(), [ref]$parsed) -and $parsed -ge 5) { $lvl = $parsed }
+                $lvl = 0
+                if ([int]::TryParse((Get-Content $lvlFile -Raw).Trim(), [ref]$lvl) -and $lvl -ge 5) {
+                    Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightnessMethods -ErrorAction Stop |
+                        ForEach-Object { $_ | Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{ Timeout = [uint32]0; Brightness = [byte]$lvl } | Out-Null }
+                }
             }
-            Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightnessMethods -ErrorAction Stop |
-                ForEach-Object { $_ | Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{ Timeout = [uint32]0; Brightness = [byte]$lvl } | Out-Null }
         } catch { }
         $ctx.ExitThread()
     }

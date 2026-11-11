@@ -1473,13 +1473,30 @@ class PresenceEngine {
         // frozen any second. While our capture runs, WE are the face sensor:
         // the page's faces (null — it released the device) must not be read
         // as evidence here, so the whole client-driven logic below is skipped.
+        // Defined before the fallback gate below uses them.
+        const cam = this.clientDiag && this.clientDiag.cam;
+        const det = this.clientDiag && this.clientDiag.det;
+        const fallback = !!cfg.noCamMode && this.noCam;
         if (this.faceFallback.active) {
             if (this.faceFallback.framesFresh(now)) {
-                await this._tickServerFace(cfg, now);
-                return;
+                // FULL ownership only while the page actually gave the camera
+                // up (handoff) or has no camera of its own to report with. A
+                // live page still on cam='ok' outranks our capture: our side
+                // exists for the frozen/handed-off case, and without this gate
+                // a fallback that started during the boot gap kept overriding
+                // every healthy beat forever (the screen dimmed while the user
+                // sat in front of a reporting page).
+                if (cam === 'handoff' || this.noCam) {
+                    await this._tickServerFace(cfg, now);
+                    return;
+                }
+                // The page is back in charge — release the device for it.
+                this.faceFallback.stop('page-reclaimed');
+                console.log('[FaceFallback] live page (cam=' + cam + ') reclaimed the camera — standing down');
+            } else {
+                // Capture died (device yanked, ffmpeg gone): back to the page.
+                this.faceFallback.stop('stale');
             }
-            // Capture died (device yanked, ffmpeg gone): back to the page.
-            this.faceFallback.stop('stale');
         }
 
         // ── 0b. Camera health ─────────────────────────────────────────
@@ -1492,9 +1509,7 @@ class PresenceEngine {
         // NO camera device at all (getUserMedia NotFoundError, not a busy or
         // broken one) and the user opted into noCamMode, standing down forever
         // is useless; the engine degrades to input-idle power saving instead.
-        const cam = this.clientDiag && this.clientDiag.cam;
-        const det = this.clientDiag && this.clientDiag.det;
-        const fallback = !!cfg.noCamMode && this.noCam;
+        // (cam/det/fallback are hoisted above the fallback gate.)
         this.fallback = fallback;
         // 'missing' = the browser could not evaluate the face cascade (CSP,
         // fetch failure). Same reasoning as a dead camera: no detector means
@@ -2754,3 +2769,31 @@ function shutdown() {
     try { server.close(() => process.exit(0)); } catch { process.exit(0); }
     setTimeout(() => process.exit(0), 1500).unref();
 }
+
+// ── Uninstall watchdog ───────────────────────────────────────────────
+// The backend is detached ON PURPOSE: it must survive DSH restarts. The flip
+// side is that an UNINSTALL — the host simply deletes the plugin directory —
+// cannot reach it through any lifecycle hook. The process keeps running from
+// memory, still dimming the screen on its own schedule, and the user sees
+// "I uninstalled it but the screen keeps going dark" (observed in the field).
+// Detection is dead simple: if our own files vanish, the plugin is gone.
+// Two strikes (30s) so a directory rebuild / partial update never trips it.
+let uninstallStrikes = 0;
+const uninstallWatch = setInterval(() => {
+    let gone = false;
+    try {
+        gone = !existsSync(join(__dirname, 'server.js')) ||
+               !existsSync(join(__dirname, 'package.json'));
+    } catch { gone = true; }
+    if (!gone) { uninstallStrikes = 0; return; }
+    uninstallStrikes += 1;
+    if (uninstallStrikes < 2) return;
+    clearInterval(uninstallWatch);
+    console.log('[Plugin] our files are gone — plugin uninstalled; cleaning up and exiting');
+    try {
+        appendFileSync(join(MODELS_DIR, 'server.log'),
+            `[Plugin] ${new Date().toISOString()} uninstalled (files deleted) — backend self-terminated\n`);
+    } catch { /* models dir may be gone too */ }
+    shutdown();
+}, 15000);
+try { uninstallWatch.unref(); } catch { /* noop */ }
