@@ -867,7 +867,7 @@
           this.beatWorker = w;
           // Visible marker so it is obvious from DevTools which build is live
           // (dsh serves the client bundle from memory captured at startup).
-          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261111d)');
+          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261111e)');
         } catch {
           // Worker construction blocked (strict CSP etc.) — old behaviour.
           this.timer = setInterval(() => { this._beat(); this._watchdogTick(); }, this.intervalMs);
@@ -1761,6 +1761,21 @@
               min: 1, max: 60, step: 1, style: s.inputSmall,
             }),
             h('span', { style: { fontSize: 12, color: T.text2 } }, '分钟键鼠空闲后熄屏（仅键鼠节能模式生效）')
+          ),
+          // Page frozen / closed: no face channel exists at all. The server
+          // falls back to OS input idle, and this is how fast it reacts.
+          // Milliseconds, not minutes — with no face evidence the keyboard is
+          // the presence signal, and a 3-minute grace read as "it never
+          // reacts" the moment the dsh window went to the background.
+          h('div', { style: { ...s.row, marginBottom: 0 } },
+            h('span', { style: s.label }, '页面失联熄屏'),
+            h('input', {
+              type: 'number',
+              value: Math.round((config.blindAwaySec != null ? config.blindAwaySec : 0.8) * 1000),
+              onChange: e => upd('blindAwaySec', Math.min(Math.max(parseInt(e.target.value) || 800, 300), 60000) / 1000),
+              min: 300, max: 60000, step: 100, style: s.inputSmall,
+            }),
+            h('span', { style: { fontSize: 12, color: T.text2 } }, '毫秒键鼠空闲后熄屏（页面被后台冻结、无人脸信号时）')
           )
         ),
 

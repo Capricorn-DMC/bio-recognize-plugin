@@ -142,10 +142,11 @@ let config = {
     watchdogMs: 8000,      // no client heartbeat for this long → stand down
     // Degraded-mode timeout: with the client page gone/frozen (no face
     // channel), blank the screen after the OS reports this much keyboard/mouse
-    // idle. Long by design — an active reader or a fullscreen video must not
-    // trip it, and the face detector does the fast blanking whenever the page
-    // is alive. Clamped to >= 30s when configured.
-    blindAwaySec: 180,
+    // idle. SECONDS, and deliberately short: when the page is dead the input
+    // monitor is the only presence signal left, and the user wants face-path
+    // latency (~2s), not a minutes-long grace. 0.8 ≈ "looked away from the
+    // keyboard, screen follows". Clamped to >= 0.3 when configured.
+    blindAwaySec: 0.8,
     // ── Identity (1:N face matching) ───────────────────────────────────
     // identityCheck: a detected face only counts if it matches an enrolled
     // person. This is what makes the screen "only mine" instead of "anybody
@@ -1080,46 +1081,43 @@ class PresenceEngine {
             this.presentSince = null;
             this.absentStreakStart = null;
             this.keyHeldSince = null;
-            // Only act after a real loss (watchdog), not for a sub-second gap
-            // that will heal itself.
-            if (hbAge > watchdogMs) {
-                // ── Degraded mode ────────────────────────────────────────
-                // The client is GONE (frozen page, closed window, dead
-                // renderer) but the plugin is enabled and the machine is
-                // still in front of a human — or not. The face channel is
-                // dead, so the OS input monitor is the only sensor left, and
-                // it lives in a PowerShell child of THIS process: it cannot
-                // be frozen by anything the browser does.
-                //
-                //   screen ON  + no input for blindAwaySec → blank.
-                //     This is what makes "walked away while the dsh page was
-                //     frozen" still turn the display off instead of leaving
-                //     it on forever. Field case: heartbeats stopped the
-                //     moment the dsh window lost focus, so face-absence
-                //     blanking was never reachable; the screen stayed lit all
-                //     night and the user saw "no reaction at all".
-                //
-                //   screen BLACK + input is ACTIVE right now → restore.
-                //     The old unconditional restore leaked the bioOnly
-                //     promise ("a mouse move can never wake the screen") in
-                //     exactly the case the user cannot debug. Restore now
-                //     only while someone is verifiably typing/moving; in
-                //     pure bioOnly the 8s Shift/Esc hatch (GetAsyncKeyState,
-                //     server-side, needs no page at all) remains the only
-                //     input-driven exit.
-                //     If the input monitor itself has no data, fall back to
-                //     the old unconditional restore — a stuck black screen is
-                //     worse than a spurious wake.
-                const idleSec = this.input ? this.input.getIdleSeconds() : null;
-                const blindAwaySec = Math.max(parseFloat(cfg.blindAwaySec) || 180, 30);
+            // ── Degraded mode ─────────────────────────────────────────────
+            // The client is GONE (frozen page, closed window, dead renderer)
+            // but the plugin is enabled and the machine is still in front of
+            // a human — or not. The face channel is dead, so the OS input
+            // monitor is the only sensor left, and it lives in a child
+            // process of THIS server: it cannot be frozen by anything the
+            // browser does.
+            //
+            // Both directions are FAST on purpose: with no face channel the
+            // only thing that distinguishes "still here, reading" from
+            // "walked away" is whether the keyboard/mouse moved, and the
+            // user expects face-path latency (~2s), not a minutes-long
+            // grace period. blindAwaySec is milliseconds-configurable down
+            // to 0.3s.
+            const idleSec = this.input ? this.input.getIdleSeconds() : null;
+            const blindGapMs = Math.max(hbGapLimit, 1500);
+            // In keyboard/mouse power-save mode (a machine with no camera at
+            // all) the user has already chosen a minutes-long idle timeout;
+            // honour that number instead of the aggressive page-lost default,
+            // otherwise a dead page would blank a no-camera machine in 0.8s.
+            const blindAwaySec = this.fallback
+                ? Math.max(parseFloat(cfg.noCamIdleSec) || 300, 5)
+                : Math.max(parseFloat(cfg.blindAwaySec) || 0.8, 0.3);
+            if (hbAge > blindGapMs) {
                 if (!this.screen.isBlack && idleSec != null &&
                     idleSec >= blindAwaySec && this.firstHeartbeatAt) {
-                    console.log(`[Presence] Client silent ${Math.round(hbAge / 1000)}s + input idle ` +
-                        `${Math.round(idleSec)}s >= ${blindAwaySec}s — blanking (blind-away)`);
+                    console.log(`[Presence] Client silent ${Math.round(hbAge)}ms + input idle ` +
+                        `${Math.round(idleSec * 1000)}ms >= ${Math.round(blindAwaySec * 1000)}ms — blanking (blind-away)`);
                     cfg.isScreenBlack = !(await this._blank());
                     this.reason = 'blind-away';
                     this.actionTaken = true;
                 } else if (this.screen.isBlack && (idleSec == null || idleSec < 2)) {
+                    // Restoring does NOT wait for the 8s watchdog any more:
+                    // after a blind-away blank the user is usually one
+                    // mouse-move away from the screen, and making them wait
+                    // for a dead page to be declared dead read as "the
+                    // screen is stuck black".
                     console.log('[Presence] Client heartbeat lost — restoring screen');
                     cfg.isScreenBlack = !(await this._wake());
                     this.reason = 'watchdog';
