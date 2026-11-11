@@ -13,7 +13,7 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
 import vm from 'node:vm';
-import { execSync, execFileSync, spawn } from 'child_process';
+import { execSync, execFileSync, spawn, spawnSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -970,16 +970,13 @@ class FaceFallback {
         // Explicit config wins; otherwise the first DirectShow video device.
         const forced = config.serverFaceCamera;
         if (forced) return String(forced);
-        try {
-            const out = execFileSync('ffmpeg', ['-hide_banner', '-list_devices', 'true',
-                '-f', 'dshow', '-i', 'dummy'], { encoding: 'utf8', timeout: 15000 });
-            return null; // ffmpeg writes devices to stderr; encoding keeps it in out only on some builds
-        } catch (e) {
-            // ffmpeg exits non-zero for -list_devices; the device list is on stderr.
-            const text = String(e?.stderr || '');
-            const m = text.match(/"([^"]+)"\s+\(video\)/);
-            return m ? m[1] : null;
-        }
+        // ffmpeg prints the device list on STDERR and (on this build) exits 0,
+        // so spawnSync + stderr covers both the success and the non-zero path.
+        const r = spawnSync('ffmpeg', ['-hide_banner', '-list_devices', 'true',
+            '-f', 'dshow', '-i', 'dummy'], { encoding: 'utf8', timeout: 15000 });
+        const text = String(r.stderr || '');
+        const m = text.match(/"([^"]+)"\s+\(video\)/);
+        return m ? m[1] : null;
     }
 
     maybeStart(fallbackNoCam) {
