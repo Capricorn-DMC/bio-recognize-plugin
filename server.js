@@ -142,11 +142,17 @@ let config = {
     watchdogMs: 8000,      // no client heartbeat for this long → stand down
     // Degraded-mode timeout: with the client page gone/frozen (no face
     // channel), blank the screen after the OS reports this much keyboard/mouse
-    // idle. SECONDS, and deliberately short: when the page is dead the input
-    // monitor is the only presence signal left, and the user wants face-path
-    // latency (~2s), not a minutes-long grace. 0.8 ≈ "looked away from the
-    // keyboard, screen follows". Clamped to >= 0.3 when configured.
-    blindAwaySec: 0.8,
+    // idle. SECONDS, tunable down to 0.5s from the settings page.
+    //
+    // Why not sub-second by default: input idle cannot tell "walked away"
+    // from "reading a long paragraph" — a 0.8s default blanked the screen
+    // every time the user stopped typing for two seconds (measured on this
+    // machine: idle 2.3s -> OFF). The face path is the one that is allowed
+    // to be trigger-happy, because it can actually see the person. 10s is
+    // ~18x faster than the old 3-minute grace while staying usable; users
+    // who want face-like latency while the page is dead can dial it to
+    // 0.5s and pay the false-blank cost knowingly.
+    blindAwaySec: 10,
     // ── Identity (1:N face matching) ───────────────────────────────────
     // identityCheck: a detected face only counts if it matches an enrolled
     // person. This is what makes the screen "only mine" instead of "anybody
@@ -1103,7 +1109,7 @@ class PresenceEngine {
             // otherwise a dead page would blank a no-camera machine in 0.8s.
             const blindAwaySec = this.fallback
                 ? Math.max(parseFloat(cfg.noCamIdleSec) || 300, 5)
-                : Math.max(parseFloat(cfg.blindAwaySec) || 0.8, 0.3);
+                : Math.max(parseFloat(cfg.blindAwaySec) || 10, 0.5);
             if (hbAge > blindGapMs) {
                 if (!this.screen.isBlack && idleSec != null &&
                     idleSec >= blindAwaySec && this.firstHeartbeatAt) {

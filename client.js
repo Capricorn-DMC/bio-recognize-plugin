@@ -1764,18 +1764,18 @@
           ),
           // Page frozen / closed: no face channel exists at all. The server
           // falls back to OS input idle, and this is how fast it reacts.
-          // Milliseconds, not minutes — with no face evidence the keyboard is
-          // the presence signal, and a 3-minute grace read as "it never
-          // reacts" the moment the dsh window went to the background.
+          // Seconds with decimals: 0.5 blanks as fast as the face path but
+          // also blanks whenever you pause to read; 10s is the usable
+          // default. The face path (page alive) stays at ~2s regardless.
           h('div', { style: { ...s.row, marginBottom: 0 } },
             h('span', { style: s.label }, '页面失联熄屏'),
             h('input', {
               type: 'number',
-              value: Math.round((config.blindAwaySec != null ? config.blindAwaySec : 0.8) * 1000),
-              onChange: e => upd('blindAwaySec', Math.min(Math.max(parseInt(e.target.value) || 800, 300), 60000) / 1000),
-              min: 300, max: 60000, step: 100, style: s.inputSmall,
+              value: Math.round((config.blindAwaySec != null ? config.blindAwaySec : 10) * 10) / 10,
+              onChange: e => upd('blindAwaySec', Math.min(Math.max(parseFloat(e.target.value) || 10, 0.5), 600)),
+              min: 0.5, max: 600, step: 0.5, style: s.inputSmall,
             }),
-            h('span', { style: { fontSize: 12, color: T.text2 } }, '毫秒键鼠空闲后熄屏（页面被后台冻结、无人脸信号时）')
+            h('span', { style: { fontSize: 12, color: T.text2 } }, '秒键鼠空闲后熄屏（页面被后台冻结、无人脸信号时；太小会把“停下阅读”也判为离开）')
           )
         ),
 
