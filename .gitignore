@@ -16,3 +16,5 @@ models/_server.err
 Thumbs.db
 .DS_Store
 models/presence.log
+models/_boot.out
+models/_boot.err
