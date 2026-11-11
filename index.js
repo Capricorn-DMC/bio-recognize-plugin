@@ -10,7 +10,7 @@ import http from 'http';
 import https from 'https';
 import { URL } from 'url';
 import { spawn, execFileSync } from 'child_process';
-import { createWriteStream, readFileSync, writeFileSync } from 'fs';
+import { createWriteStream, readFileSync, writeFileSync, statSync, unlinkSync, existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -40,8 +40,21 @@ async function ensureServer() {
     let livePid = listenerPid(SERVER_PORT);
     if (livePid) {
         const ours = readPidFile();
-        if (livePid !== ours) {
-            console.log(`[Plugin] Port ${SERVER_PORT} is held by pid ${livePid} (pidfile: ${ours || 'none'}) — replacing it`);
+        // Two independent reasons to replace it:
+        //   - the pid file names someone else (or nobody): it is not ours;
+        //   - it IS "ours" but started before server.js was last written, so
+        //     it is running code we have already replaced. Without this the
+        //     backend survived every restart untouched and every fix looked
+        //     like it had done nothing.
+        const stale = (livePid === ours) && backendRunsStaleCode(livePid);
+        // The port owner is the truth. If the file names a process that no
+        // longer exists, drop the file now so diagnostics stop chasing it.
+        if (ours && ours !== livePid && !pidAlive(ours)) {
+            try { unlinkSync(join(__dirname, 'models', '.server.pid')); } catch { /* noop */ }
+        }
+        if (livePid !== ours || stale) {
+            console.log(`[Plugin] Port ${SERVER_PORT} is held by pid ${livePid} ` +
+                `(pidfile: ${ours || 'none'}${stale ? ', started before server.js was last modified' : ''}) — replacing it`);
             // Order matters: ask it to quit over HTTP first. That needs no
             // process rights, so it also works when the old backend runs with
             // higher privileges than us ("taskkill: 拒绝访问").
@@ -90,14 +103,12 @@ async function ensureServer() {
             stdio: ['ignore', 'pipe', 'pipe'],
             detached: true,
         });
-        // Write the pid IMMEDIATELY (not after the health check): a DSH
-        // restart during the boot window would otherwise leave a stale pid
-        // file, and the next ensureServer would treat our own fresh backend
-        // as a foreign process and kill it.
-        try { writeFileSync(pidFile, String(serverProcess.pid)); } catch { /* best effort */ }
-        // Keep the last chunk of backend output on disk: when something goes
-        // wrong in the browser ("检测中" forever) the reason is almost always
-        // in this log, and a piped-and-discarded stdio made it unrecoverable.
+        const childPid = serverProcess.pid;
+        // Wire the log BEFORE anything else can fail. A child that dies on
+        // EADDRINUSE exits in a few milliseconds, and with the pipes attached
+        // afterwards its only explanation ("bind failed") was discarded — the
+        // pid file then pointed at a dead pid, /presence kept answering from
+        // the old process, and the restart looked like a no-op.
         try {
             const logFile = join(__dirname, 'models', 'server.log');
             const logStream = createWriteStream(logFile, { flags: 'a' });
@@ -107,7 +118,25 @@ async function ensureServer() {
             serverProcess.stderr?.on('data', d => logStream.write(d));
             serverProcess.on('exit', () => { try { logStream.end(); } catch {} });
         } catch { /* logging is best-effort */ }
-        serverProcess.on('exit', () => { serverProcess = null; serverStarting = false; });
+        // Write the pid IMMEDIATELY (not after the health check): a DSH
+        // restart during the boot window would otherwise leave a stale pid
+        // file, and the next ensureServer would treat our own fresh backend
+        // as a foreign process and kill it.
+        try { writeFileSync(pidFile, String(childPid)); } catch { /* best effort */ }
+        serverProcess.on('error', (e) => {
+            console.error(`[Plugin] backend spawn failed: ${e?.message || e}`);
+            serverProcess = null; serverStarting = false;
+        });
+        serverProcess.on('exit', (code) => {
+            // The pid file must never outlive the process it names: a stale
+            // entry makes the NEXT start believe a backend is running.
+            try { if (readPidFile() === childPid) unlinkSync(pidFile); } catch { /* noop */ }
+            if (!serverProcess || serverProcess.pid === childPid) { serverProcess = null; serverStarting = false; }
+            const holder = listenerPid(SERVER_PORT);
+            if (holder && holder !== childPid) {
+                console.error(`[Plugin] backend pid ${childPid} exited (code ${code}) while pid ${holder} still holds port ${SERVER_PORT} — that process is running old code`);
+            }
+        });
         serverProcess.unref();
         serverStarting = false;
         // Poll health until the backend answers (it pre-warms a resident
@@ -222,6 +251,41 @@ async function replaceStaleBackend() {
 
 function pidAlive(pid) {
     try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+// When did this process start, in epoch ms? 0 when it cannot be determined.
+//
+// ToFileTimeUtc()/10000 - 11644473600000 is exact and locale-free; formatting
+// CreationDate as a string and parsing it back breaks on a Chinese locale
+// ("2026/11/10 17:28:58"), and this value decides whether we kill a process.
+function processStartMs(pid) {
+    if (!pid) return 0;
+    try {
+        const out = execFileSync('powershell', ['-NoProfile', '-Command',
+            `$p=Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"; ` +
+            'if($p){[int64]($p.CreationDate.ToFileTimeUtc()/10000-11644473600000)}',
+        ], { encoding: 'utf8', timeout: 10000 }).trim();
+        const ms = parseInt(out, 10);
+        return Number.isFinite(ms) && ms > 0 ? ms : 0;
+    } catch { return 0; }
+}
+
+// Is the backend on the port running OLD code?
+//
+// The pid file matched and the port was held, so ensureServer used to answer
+// "already running" — even when that process had been started BEFORE server.js
+// was last edited. Field evidence: the backend was 8 minutes older than the
+// fix, so every restart "changed nothing", the plugin kept the behaviour that
+// had just been fixed, and the pid file pointed at a pid that had long since
+// died. Comparing the process start time with the file's mtime is the only
+// check that answers the question the user is actually asking.
+function backendRunsStaleCode(pid, codeFile = SERVER_SCRIPT) {
+    const started = processStartMs(pid);
+    if (!started) return false;                 // unknown → never kill blindly
+    try {
+        const codeMtime = statSync(codeFile).mtimeMs;
+        return started + 2000 < codeMtime;      // 2s covers write/boot ordering
+    } catch { return false; }
 }
 
 // Whoever is LISTENING on the backend port — that is the real backend, no

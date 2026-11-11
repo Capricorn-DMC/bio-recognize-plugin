@@ -115,6 +115,9 @@
       recoverAt: 0,        // rate-limit for camera re-open
       opening: false,      // a getUserMedia() call is in flight
       inFlight: false,     // a heartbeat POST is in flight
+      inFlightSince: 0,    // when it started — a stuck one is released by the watchdog
+      picoRetryAt: 0,      // next attempt to (re)load the face detector
+      rejCount: 0,         // unhandled rejections seen on this page (diagnostic)
       noCam: false,        // no camera device exists at all (NotFoundError)
       lastBeatAt: 0,       // last completed beat (any outcome)
       diag: { cam: 'idle', err: null, ms: 0, beats: 0, lastBeatOk: null, emb: null, embErr: null, embMs: null, migrate: null, backend: null, warmMs: null },
@@ -360,9 +363,21 @@
           }
           this.lastEmbVec = out[0];
           this.lastEmbAt = performance.now();
+          this._embFails = 0;
           return out;
         } catch (e) {
           this.diag.embErr = String(e?.message || e).slice(0, 160);
+          // A broken inference pipeline must not be hammered every 1.2s
+          // forever: each failure costs a full graph round-trip on the main
+          // thread and, for the whole page, a stutter. Five consecutive
+          // failures turn the CNN path off and fall back to the legacy
+          // descriptor — presence and screen control never depended on it.
+          this._embFails = (this._embFails || 0) + 1;
+          if (this._embFails >= 5 && this.embOk) {
+            this.embOk = false;
+            this.diag.emb = 'broken';
+            console.warn('[Heartbeat] CNN embeddings failed 5x in a row — falling back to the legacy descriptor:', this.diag.embErr);
+          }
           return [];
         }
       },
@@ -543,11 +558,24 @@
             if (this.video && this.video.videoWidth) this.noFrameSince = null;
           } catch { /* noop */ }
           this._ensureBeatTimer();
-          this._send();
+          this._beat();
         };
         document.addEventListener('visibilitychange', () => { if (!document.hidden) wake(); });
         window.addEventListener('focus', wake);
         window.addEventListener('pageshow', wake);
+        this._hookRejections();
+      },
+
+      // Count unhandled rejections raised by anything on this page. They are
+      // not ours to fix, but a page drowning in them is a page whose main
+      // thread can starve — and "the loop went quiet" needed a number to tell
+      // that apart from a bug of our own. It rides along in the heartbeat.
+      _hookRejections() {
+        if (this._rejHooked) return;
+        try {
+          this._rejHooked = true;
+          window.addEventListener('unhandledrejection', () => { this.rejCount += 1; });
+        } catch { this._rejHooked = false; }
       },
 
       release(token) {
@@ -625,27 +653,101 @@
       // a plain interval if workers are unavailable.
       _ensureBeatTimer(force) {
         if (!this.running) return;
+        this._hookRejections();
         const hasClock = !!(this.beatWorker || this.timer);
         if (hasClock && !force) return;
         this._teardownBeatTimer();
         try {
+          // Two rhythms in one worker: the beat itself, and a 2s watchdog.
+          // The watchdog is the point of this change. Field evidence: the page
+          // was alive, the camera was open, and the server had not received a
+          // single heartbeat for minutes while the console flooded with
+          // uncaught promise errors from OTHER code on the page. Whatever the
+          // cause — a beat wedged in flight, a main thread that stalled long
+          // enough to drop the interval, or an error that escaped an async
+          // function — the loop had no way back. A worker timer is immune to
+          // page throttling and keeps firing even while the main thread is
+          // buried, so it is the only clock that can notice "I have not seen a
+          // beat in a while" from a position where it can still act.
           const src =
-            'let h=null;onmessage=(e)=>{const d=e.data||{};' +
-            'if(d.cmd==="start"){if(h)clearInterval(h);h=setInterval(()=>postMessage(1),d.ms);}' +
-            'else if(d.cmd==="stop"){if(h){clearInterval(h);h=null;}}};';
+            'let h=null,w=null;onmessage=(e)=>{const d=e.data||{};' +
+            'if(d.cmd==="start"){if(h)clearInterval(h);if(w)clearInterval(w);' +
+            'h=setInterval(()=>postMessage({t:"beat"}),d.ms);' +
+            'w=setInterval(()=>postMessage({t:"watch"}),2000);}' +
+            'else if(d.cmd==="stop"){if(h){clearInterval(h);h=null;}if(w){clearInterval(w);w=null;}}};';
           const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
           const w = new Worker(url);
           URL.revokeObjectURL(url);
-          w.onmessage = () => { try { this._send(); } catch { /* noop */ } };
+          w.onmessage = (ev) => {
+            const kind = ev && ev.data && ev.data.t;
+            if (kind === 'watch') this._watchdogTick();
+            else this._beat();
+          };
           w.postMessage({ cmd: 'start', ms: this.intervalMs });
           this.beatWorker = w;
           // Visible marker so it is obvious from DevTools which build is live
           // (dsh serves the client bundle from memory captured at startup).
-          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261110g)');
+          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261111a)');
         } catch {
           // Worker construction blocked (strict CSP etc.) — old behaviour.
-          this.timer = setInterval(() => this._send(), this.intervalMs);
+          this.timer = setInterval(() => { this._beat(); this._watchdogTick(); }, this.intervalMs);
         }
+      },
+
+      // A beat must never escape as an unhandled rejection: `_send()` is async,
+      // so a throw anywhere in its body (even before its own try) rejected a
+      // promise nobody awaited, and the *next* beat was skipped because
+      // `inFlight` stayed true. That is a permanent, silent stop — exactly the
+      // "moving the face away does nothing" the field kept reporting.
+      _beat() {
+        if (!this.running) return;
+        try {
+          const p = this._send();
+          if (p && typeof p.catch === 'function') {
+            p.catch((e) => {
+              this.diag.lastBeatOk = false;
+              this.diag.err = 'beat: ' + String(e?.message || e).slice(0, 160);
+              this.lastBeatAt = Date.now();
+              this.inFlight = false;
+            });
+          }
+        } catch (e) {
+          this.diag.lastBeatOk = false;
+          this.diag.err = 'beat: ' + String(e?.message || e).slice(0, 160);
+          this.lastBeatAt = Date.now();
+          this.inFlight = false;
+        }
+      },
+
+      // Runs on the worker clock every 2s — never throttled, never skipped.
+      _watchdogTick() {
+        if (!this.running) return;
+        const now = Date.now();
+        // (1) A POST that never settled (backend wedged, socket stuck, fetch
+        // that ignored its own timeout) holds `inFlight` forever, which makes
+        // every later beat a no-op. Free the slot after 6s: worst case is one
+        // duplicate beat, which the server deduplicates by design.
+        if (this.inFlight && now - (this.inFlightSince || 0) > 6000) {
+          console.warn('[Heartbeat] beat stuck in flight ' + (now - this.inFlightSince) + 'ms — releasing');
+          this.diag.stuck = (this.diag.stuck || 0) + 1;
+          this.inFlight = false;
+        }
+        // (2) No beat on the wire for far longer than the cadence: the clock
+        // died, the interval was cleared, or the page froze long enough to
+        // lose it. Recreate the clock from scratch and beat immediately.
+        const age = now - (this.lastBeatAt || 0);
+        if (age > Math.max(3000, this.intervalMs * 6)) {
+          console.warn('[Heartbeat] no beat for ' + Math.round(age) + 'ms — restarting the loop (tok=' +
+            this.tokens.size + ', clock=' + (this.beatWorker ? 'worker' : this.timer ? 'timer' : 'none') + ')');
+          this.diag.forced = (this.diag.forced || 0) + 1;
+          this.inFlight = false;
+          this._ensureBeatTimer(true);
+          this._beat();
+        }
+        // (3) Camera liveness belongs here, not on a main-thread interval: the
+        // one failure that needs it (a dead track while the page is hidden) is
+        // exactly the case where a page interval stops firing.
+        this._checkCamera(now);
       },
 
       _teardownBeatTimer() {
@@ -657,10 +759,10 @@
         if (this.timer) { clearInterval(this.timer); this.timer = null; }
       },
 
-      // Last line of defence: every second, make sure the loop is actually
-      // alive. Any bug that clears the timer, throttles it away, or loses the
-      // camera now self-heals within a second instead of silently dying until
-      // the user restarts dsh.
+      // Last line of defence when the Worker clock is unavailable (strict CSP):
+      // a plain 1s interval that re-creates the beat clock and beats by hand.
+      // The worker's 2s watchdog is the primary path — this one is throttled in
+      // a hidden page, which is exactly why the worker exists.
       _startSupervisor() {
         if (this.supervisor) return;
         this.supervisor = setInterval(() => {
@@ -670,13 +772,8 @@
           const age = Date.now() - (this.lastBeatAt || 0);
           if (age > Math.max(this.intervalMs * 3, 1500)) {
             console.warn('[Heartbeat] loop stalled ' + Math.round(age) + 'ms — forcing a beat');
-            this._send();
-          }
-          // Camera side: recover a dead/missing picture without waiting on the
-          // (throttled) watchdog tick.
-          const v = this.video;
-          if (!this.opening && (!v || !v.videoWidth)) {
-            if (this.noFrameSince == null) this.noFrameSince = Date.now();
+            this.inFlight = false;
+            this._beat();
           }
         }, 1000);
       },
@@ -697,25 +794,15 @@
 
       // Camera liveness: a stream can be killed by the OS (device sleep, another
       // app grabbing it, USB hiccup) without any JS error. When that happens
-      // `videoWidth` stays 0 and — before this watchdog existed — heartbeats
-      // stopped being sent at all, so the UI sat on "检测中" forever and nothing
-      // reacted to a face. Poll once a second and re-open the camera.
+      // `videoWidth` stays 0 and — before this existed — heartbeats stopped
+      // being sent at all, so the UI sat on "检测中" forever and nothing reacted
+      // to a face. The check itself lives in _checkCamera so the worker
+      // watchdog and this interval share one implementation.
       _startWatchdog() {
         if (this.watchdog) return;
         this.watchdog = setInterval(() => {
           if (!this.running) return;
-          const v = this.video;
-          const alive = !!(v && v.videoWidth && v.readyState >= 2 &&
-            this.stream && this.stream.getVideoTracks().some(t => t.readyState === 'live'));
-          if (alive) { this.noFrameSince = null; if (this.diag.cam !== 'ok' && this.diag.cam !== 'idle') { this.diag.cam = 'ok'; this.diag.err = null; } return; }
-          if (this.noFrameSince == null) this.noFrameSince = Date.now();
-          this.diag.cam = this.video ? 'novideo' : 'error';
-          // 2.5s of no frames = the stream is dead, not just warming up.
-          if (Date.now() - this.noFrameSince > 2500 && Date.now() > this.recoverAt) {
-            this.recoverAt = Date.now() + 4000;
-            console.warn('[Heartbeat] camera stalled — reopening');
-            this._reopen();
-          }
+          this._checkCamera(Date.now());
         }, 1000);
       },
 
@@ -811,47 +898,43 @@
         // feel progressively slower).
         if (this.inFlight) return;
         this.inFlight = true;
-        // Camera liveness on the BEAT path. The watchdog uses a 1s
-        // setInterval, which a hidden page throttles into silence — so the
-        // exact failure that needs it (the video element paused or the track
-        // dead while the page is in the background) is the one it can never
-        // see, and the beats kept arriving with a stale cam:'ok' and no
-        // faces while the server waited forever. The beat runs on the worker
-        // clock, so it always fires: check here, reopen after 2.5s of death,
-        // and let the beat carry the truth.
-        {
-          const v = this.video;
-          const alive = !!(v && v.videoWidth && v.readyState >= 2 &&
-            this.stream && this.stream.getVideoTracks().some(t => t.readyState === 'live'));
-          if (alive) {
-            this.noFrameSince = null;
-            if (this.diag.cam !== 'ok' && this.diag.cam !== 'idle') { this.diag.cam = 'ok'; this.diag.err = null; }
-          } else {
-            if (this.noFrameSince == null) this.noFrameSince = Date.now();
-            this.diag.cam = this.video ? 'novideo' : 'error';
-            if (Date.now() - this.noFrameSince > 2500 && Date.now() > this.recoverAt) {
-              this.recoverAt = Date.now() + 4000;
-              console.warn('[Heartbeat] camera stalled — reopening (beat path)');
-              this._reopen();
-            }
-          }
-        }
-        const body = { cam: this.diag.cam, det: this.picoReady ? 'ok' : 'missing' };
-        // Loop health: without this, "no beats arrived" is indistinguishable
-        // between a frozen tab, a throttled timer and a released token.
-        body.clock = this.beatWorker ? 'worker' : (this.timer ? 'timer' : 'none');
-        body.vis = document.hidden ? 'hidden' : 'visible';
-        body.tok = this.tokens.size;
-        // Tell the server this machine has NO camera device at all — the only
-        // statement that may engage its input-idle fallback mode.
-        if (this.noCam) body.nocam = true;
-        // Report whether the CNN models are live: the settings page shows this
-        // so a silent fallback to the weak descriptor is visible.
-        if (this.diag.emb) body.emb = this.diag.emb;
-        if (this.diag.embMs != null) body.embMs = this.diag.embMs;
-        if (this.diag.migrate) body.migrate = this.diag.migrate;
-        if (this.diag.backend) body.backend = this.diag.backend;
+        this.inFlightSince = Date.now();
+        // Everything below runs inside try/finally. Before this, the camera
+        // block sat OUTSIDE it: any throw in there left `inFlight` true, and
+        // from that moment every single beat returned at the guard above —
+        // permanently, silently, with the camera still open. The page looked
+        // healthy, the server saw a dead client, and nothing ever blanked.
         try {
+          this._checkCamera(Date.now());
+          if (!this.picoReady && !this.picoLoading && Date.now() > (this.picoRetryAt || 0)) {
+            // The detector is the ONLY source of face evidence. If its first
+            // load lost a race with page boot (or the backend was still
+            // starting), the client used to stay "det: missing" for the whole
+            // session: beats carried no `faces` at all, so the server could
+            // never see anyone arrive or leave. Retry every 15s until it loads.
+            this.picoRetryAt = Date.now() + 15000;
+            this._loadFaceDetector();
+          }
+          const body = { cam: this.diag.cam, det: this.picoReady ? 'ok' : 'missing' };
+          // Loop health: without this, "no beats arrived" is indistinguishable
+          // between a frozen tab, a throttled timer and a released token.
+          body.clock = this.beatWorker ? 'worker' : (this.timer ? 'timer' : 'none');
+          body.vis = document.hidden ? 'hidden' : 'visible';
+          body.tok = this.tokens.size;
+          // Errors thrown by anything else on this page. They are not ours, but
+          // they are the reason the main thread can starve: when this counter
+          // climbs while beats stop, the loop was buried by foreign code, not
+          // broken by us. Cheap, and it ends the guessing.
+          if (this.rejCount) body.rj = this.rejCount;
+          // Tell the server this machine has NO camera device at all — the only
+          // statement that may engage its input-idle fallback mode.
+          if (this.noCam) body.nocam = true;
+          // Report whether the CNN models are live: the settings page shows this
+          // so a silent fallback to the weak descriptor is visible.
+          if (this.diag.emb) body.emb = this.diag.emb;
+          if (this.diag.embMs != null) body.embMs = this.diag.embMs;
+          if (this.diag.migrate) body.migrate = this.diag.migrate;
+          if (this.diag.backend) body.backend = this.diag.backend;
           const video = this.video;
           if (video && video.videoWidth) {
             const det = this._detectFaces();
@@ -900,6 +983,30 @@
         } finally {
           this.inFlight = false;
         }
+      },
+
+      // Camera liveness, on the worker clock (see _watchdogTick). A stream can
+      // be killed by the OS — device sleep, another app grabbing it, a USB
+      // hiccup — with no JS error at all: videoWidth stays 0 and the beats keep
+      // saying cam:'ok' with no faces, so the server waits forever.
+      _checkCamera(now) {
+        try {
+          const v = this.video;
+          const alive = !!(v && v.videoWidth && v.readyState >= 2 &&
+            this.stream && this.stream.getVideoTracks().some(t => t.readyState === 'live'));
+          if (alive) {
+            this.noFrameSince = null;
+            if (this.diag.cam !== 'ok' && this.diag.cam !== 'idle') { this.diag.cam = 'ok'; this.diag.err = null; }
+            return;
+          }
+          if (this.noFrameSince == null) this.noFrameSince = now;
+          this.diag.cam = this.video ? 'novideo' : 'error';
+          if (now - this.noFrameSince > 2500 && now > this.recoverAt) {
+            this.recoverAt = now + 4000;
+            console.warn('[Heartbeat] camera stalled — reopening');
+            this._reopen();
+          }
+        } catch { /* never let a camera probe break the beat */ }
       },
     };
 
@@ -1381,9 +1488,17 @@
                 ? ['模型', diag.client.emb === 'ok'
                     ? `已启用${diag.client.backend ? ' · ' + diag.client.backend : ''}`
                     : diag.client.emb === 'slow' ? '设备算力不足，已跳过'
+                    : diag.client.emb === 'broken' ? '运行异常，已降级'
                     : '加载失败']
                 : null,
               diag.client && diag.client.embMs != null ? ['识别耗时', `${diag.client.embMs}ms`] : null,
+              // Which clock is driving the page heartbeat, and whether anything
+              // still holds it. "页面上什么都没在跑" used to look exactly like
+              // "服务端没反应", and the only way to tell them apart was DevTools.
+              diag.client && diag.client.clock
+                ? ['页面', `${diag.client.clock === 'worker' ? 'Worker 时钟' : '页面定时器'}${diag.client.tok != null ? ` · ${diag.client.tok} 持有` : ''}`]
+                : null,
+              diag.client && diag.client.rj ? ['页面异常', `${diag.client.rj} 次`] : null,
               diag.fallbackActive ? ['模式', '无摄像头·键鼠节能'] : diag.noCam ? ['摄像头', '未检测到设备'] : null,
               ['键鼠空闲', diag.inputIdleSeconds == null ? '—' : `${diag.inputIdleSeconds}s`],
               diag.screen && diag.screen.isBlack ? ['黑屏', `${Math.round((diag.blackForMs || 0) / 100) / 10}s`] : null,
@@ -1603,6 +1718,10 @@
     // ─── Slot Registration ──────────────────────────────────────────────────
     return {
       inject: ['slots', 'connection'],
+      // Test seam: the liveness loop is the one thing that must never die, and
+      // it cannot be observed from the outside (no DOM, no camera in a test).
+      // Exposing the singleton lets the harness drive it with stubs.
+      __heartbeat: HeartbeatMgr,
       apply(ctx) {
         realCtx = ctx;
         const renderConfig = () => h(BioRecognizeConfig, null);

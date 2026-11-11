@@ -1736,6 +1736,10 @@ class BioRecognizeBackend {
             clock: data.clock || null,
             vis: data.vis || null,
             tok: typeof data.tok === 'number' ? data.tok : null,
+            // Unhandled promise rejections counted by the page. High and
+            // climbing while beats also stop means foreign code buried the
+            // main thread — a different problem from "our loop died".
+            rj: typeof data.rj === 'number' ? data.rj : null,
             at: now,
         };
         // Latch the "no camera device exists" statement: on while the client
