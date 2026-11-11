@@ -1981,6 +1981,13 @@ class BioRecognizeBackend {
         if (data.keyEscapeMs !== undefined) config.keyEscapeMs = Math.min(Math.max(parseInt(data.keyEscapeMs, 10) || 0, 0), 60000);
         if (data.escapeVerifyMs !== undefined) config.escapeVerifyMs = Math.min(Math.max(parseInt(data.escapeVerifyMs, 10) || 5000, 1000), 15000);
         if (data.wakeStreakFrames !== undefined) config.wakeStreakFrames = Math.min(Math.max(parseInt(data.wakeStreakFrames, 10) || 3, 1), 5);
+        // Page-lost sensitivity. Seconds (float): 0.5 is the fastest the
+        // settings page offers, 600 is plenty. Without this line the field
+        // existed in the UI but every update silently fell back to the
+        // default — the exact "I changed it and nothing happened" trap.
+        if (data.blindAwaySec !== undefined) {
+            config.blindAwaySec = Math.min(Math.max(parseFloat(data.blindAwaySec) || 10, 0.5), 600);
+        }
 
         // Any judgement-rule change starts from a clean slate — stale streaks
         // from the previous rule would otherwise fire an action immediately.

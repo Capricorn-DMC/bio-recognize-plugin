@@ -15,11 +15,11 @@
   "escapeVerifyMs": 5000,
   "wakeStreakFrames": 3,
   "watchdogMs": 8000,
-  "blindAwaySec": 0.8,
+  "blindAwaySec": 10,
   "identityCheck": true,
   "matchThreshold": 0.65,
   "matchThresholdV2": 0.93,
   "lastSeen": null,
-  "isScreenBlack": true,
+  "isScreenBlack": false,
   "learnFaces": true
 }
