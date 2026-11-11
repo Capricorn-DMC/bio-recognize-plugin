@@ -577,24 +577,48 @@
             if (this._ac) { try { this._ac.close(); } catch { /* noop */ } this._ac = null; }
             return;
           }
-          if (this._ac) {
-            if (this._ac.state === 'suspended') { try { this._ac.resume().catch(() => {}); } catch { /* noop */ } }
-            return;
-          }
+          if (this._ac) { this._tryResumeAudio(); return; }
           if (!AC) return;
           const ac = new AC();
           const osc = ac.createOscillator();
           const gain = ac.createGain();
-          // 0 would be "not audible" again; this is ~-62 dB, inaudible on any
-          // speaker yet a real, non-silent stream for the browser.
-          gain.gain.value = 0.0008;
-          osc.frequency.value = 120;
+          // The freeze exemption keys off "the tab is producing audio". A
+          // near-zero gain stream may measure as silent to the audio service
+          // and grant nothing. 30 Hz sits at/below the cutoff of typical
+          // laptop speakers (inaudible in practice) while carrying real
+          // energy in the mix, and 0.04 gain keeps it far below anything a
+          // human notices even on headphones that do reproduce it.
+          gain.gain.value = 0.04;
+          osc.frequency.value = 30;
           osc.connect(gain);
           gain.connect(ac.destination);
           osc.start();
           this._ac = ac;
-          if (ac.state === 'suspended') { try { ac.resume().catch(() => {}); } catch { /* noop */ } }
+          this._tryResumeAudio();
+          // Autoplay policy: an AudioContext born without a user gesture
+          // stays 'suspended' and a suspended context exempts nothing. The
+          // first real interaction with the page (any click, any key) unlocks
+          // audio permanently for this document — latch onto it, once, so the
+          // resume actually succeeds instead of silently failing forever.
+          if (!this._audioUnlockHooked) {
+            this._audioUnlockHooked = true;
+            const unlock = () => { this._tryResumeAudio(); };
+            window.addEventListener('pointerdown', unlock, { capture: true, passive: true });
+            window.addEventListener('keydown', unlock, { capture: true, passive: true });
+            window.addEventListener('touchstart', unlock, { capture: true, passive: true });
+          }
         } catch { /* audio is best-effort: never let it break the loop */ }
+      },
+
+      // Best-effort resume; resolves immediately, never throws, safe to call
+      // from anywhere (beats, hooks, visibility handlers).
+      _tryResumeAudio() {
+        try {
+          if (this._ac && this._ac.state === 'suspended') {
+            const p = this._ac.resume();
+            if (p && p.catch) p.catch(() => { /* still locked — a later gesture retries */ });
+          }
+        } catch { /* noop */ }
       },
 
       // Last resort, and the invariant that makes this whole class of bug
@@ -800,7 +824,7 @@
           this.beatWorker = w;
           // Visible marker so it is obvious from DevTools which build is live
           // (dsh serves the client bundle from memory captured at startup).
-          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261111b)');
+          console.info('[Heartbeat] worker clock active (' + this.intervalMs + 'ms, v20261111c)');
         } catch {
           // Worker construction blocked (strict CSP etc.) — old behaviour.
           this.timer = setInterval(() => { this._beat(); this._watchdogTick(); }, this.intervalMs);
@@ -1034,6 +1058,16 @@
           body.clock = this.beatWorker ? 'worker' : (this.timer ? 'timer' : 'none');
           body.vis = document.hidden ? 'hidden' : 'visible';
           body.tok = this.tokens.size;
+          // Anti-freeze keepalive health. 'running' is the only state that
+          // exempts the page from being frozen while hidden; a context stuck
+          // in 'suspended' (autoplay policy, no user gesture yet) means the
+          // exemption is NOT active and the beat may die the moment the
+          // window loses focus. Surfaced per-beat so the gap log can say
+          // which one happened.
+          body.au = this._ac ? this._ac.state : 'none';
+          // Each beat is a free chance to flip a suspended context to running
+          // once the user has interacted with the page at all.
+          if (this._ac && this._ac.state === 'suspended') this._tryResumeAudio();
           // Errors thrown by anything else on this page. They are not ours, but
           // they are the reason the main thread can starve: when this counter
           // climbs while beats stop, the loop was buried by foreign code, not

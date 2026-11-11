@@ -68,15 +68,6 @@ bio-recognize-plugin/
 - **Client ↔ Host**：浏览器 UI 通过 DSH `/api` RPC 载体调用 Host 方法（`start`/`stop`/`status`），Host 用 `child_process` 管理 `server.js` 进程（detached + PID 文件，跨 DSH 重启可管理）。
 - **设备采集**：摄像头帧 → JPEG base64；话筒 PCM → 手动编码 16-bit WAV → base64；后端解码存 `models/captures/` 后走统一的特征提取管线（光谱 / 暗圆分析）。
 
-## 稳定性约定
-
-两条不变量，坏掉时用户看到的现象都是「人脸移开没反应」：
-
-1. **浏览器心跳必须活着。** 心跳跑在 Web Worker 时钟上（隐藏页不被节流），Worker 另外每 2s 发一个看门狗消息：若 3s 内没有成功上报，就重建时钟并立刻补一拍；若某次上报卡在 in-flight 超过 6s，直接释放（最坏是多一拍，服务端本来就去重）。`_send()` 整体包在 try/finally 里 —— 之前摄像头检查在 try 之外，那里抛一次异常就会让 `inFlight` 永久为真，之后每一拍都在入口 return，页面看着正常、服务端却以为客户端死了。
-2. **后端必须跑当前代码。** `ensureServer` 除了比对 PID 文件与端口占用者，还会比较进程启动时间与 `server.js` 的 mtime：进程比代码旧就替换。之前 PID 文件与端口对得上就「已在运行」直接收养，于是重启 DSH 后后端仍是改动前的进程。
-
-排查入口：`GET /presence` 的 `client` 字段有 `clock`（worker/timer）、`tok`（持有者数量）、`vis`、`rj`（页面未捕获 Promise 异常计数）。`clock` 在而心跳断 → 页面被别的东西拖住；`tok=0` → 没人持有检测。
-
 ## 安全注意
 
 - `models/config.json` 中的锁屏密码**明文存储**，请保护好该目录权限

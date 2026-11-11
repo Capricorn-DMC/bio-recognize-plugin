@@ -140,6 +140,12 @@ let config = {
                            // the screen alive with the keyboard either)
     wakeStreakFrames: 3,   // consecutive face frames required before waking
     watchdogMs: 8000,      // no client heartbeat for this long → stand down
+    // Degraded-mode timeout: with the client page gone/frozen (no face
+    // channel), blank the screen after the OS reports this much keyboard/mouse
+    // idle. Long by design — an active reader or a fullscreen video must not
+    // trip it, and the face detector does the fast blanking whenever the page
+    // is alive. Clamped to >= 30s when configured.
+    blindAwaySec: 180,
     // ── Identity (1:N face matching) ───────────────────────────────────
     // identityCheck: a detected face only counts if it matches an enrolled
     // person. This is what makes the screen "only mine" instead of "anybody
@@ -1074,12 +1080,50 @@ class PresenceEngine {
             this.presentSince = null;
             this.absentStreakStart = null;
             this.keyHeldSince = null;
-            // Only hand the screen back after a real loss (watchdog), not for a
-            // sub-second gap that will heal itself.
-            if (this.screen.isBlack && hbAge > watchdogMs) {
-                console.log('[Presence] Client heartbeat lost — restoring screen');
-                cfg.isScreenBlack = !(await this._wake());
-                this.reason = 'watchdog';
+            // Only act after a real loss (watchdog), not for a sub-second gap
+            // that will heal itself.
+            if (hbAge > watchdogMs) {
+                // ── Degraded mode ────────────────────────────────────────
+                // The client is GONE (frozen page, closed window, dead
+                // renderer) but the plugin is enabled and the machine is
+                // still in front of a human — or not. The face channel is
+                // dead, so the OS input monitor is the only sensor left, and
+                // it lives in a PowerShell child of THIS process: it cannot
+                // be frozen by anything the browser does.
+                //
+                //   screen ON  + no input for blindAwaySec → blank.
+                //     This is what makes "walked away while the dsh page was
+                //     frozen" still turn the display off instead of leaving
+                //     it on forever. Field case: heartbeats stopped the
+                //     moment the dsh window lost focus, so face-absence
+                //     blanking was never reachable; the screen stayed lit all
+                //     night and the user saw "no reaction at all".
+                //
+                //   screen BLACK + input is ACTIVE right now → restore.
+                //     The old unconditional restore leaked the bioOnly
+                //     promise ("a mouse move can never wake the screen") in
+                //     exactly the case the user cannot debug. Restore now
+                //     only while someone is verifiably typing/moving; in
+                //     pure bioOnly the 8s Shift/Esc hatch (GetAsyncKeyState,
+                //     server-side, needs no page at all) remains the only
+                //     input-driven exit.
+                //     If the input monitor itself has no data, fall back to
+                //     the old unconditional restore — a stuck black screen is
+                //     worse than a spurious wake.
+                const idleSec = this.input ? this.input.getIdleSeconds() : null;
+                const blindAwaySec = Math.max(parseFloat(cfg.blindAwaySec) || 180, 30);
+                if (!this.screen.isBlack && idleSec != null &&
+                    idleSec >= blindAwaySec && this.firstHeartbeatAt) {
+                    console.log(`[Presence] Client silent ${Math.round(hbAge / 1000)}s + input idle ` +
+                        `${Math.round(idleSec)}s >= ${blindAwaySec}s — blanking (blind-away)`);
+                    cfg.isScreenBlack = !(await this._blank());
+                    this.reason = 'blind-away';
+                    this.actionTaken = true;
+                } else if (this.screen.isBlack && (idleSec == null || idleSec < 2)) {
+                    console.log('[Presence] Client heartbeat lost — restoring screen');
+                    cfg.isScreenBlack = !(await this._wake());
+                    this.reason = 'watchdog';
+                }
             }
             return;
         }
@@ -1707,7 +1751,8 @@ class BioRecognizeBackend {
                 // closed tab, sleeping machine) or no component held the loop.
                 // `tok`/`clock` in the payload say which.
                 console.log(`[Presence] Heartbeat resumed after ${Math.round(beatGap)}ms — settling` +
-                    ` (clock=${data.clock || '?'}, tok=${data.tok ?? '?'}, vis=${data.vis || '?'}, rj=${data.rj ?? '?'})`);
+                    ` (clock=${data.clock || '?'}, tok=${data.tok ?? '?'}, vis=${data.vis || '?'}, ` +
+                    `au=${data.au || '?'}, rj=${data.rj ?? '?'})`);
             }
         }
         // Measure the real sampling cadence (EMA). Everything that waits on
@@ -1743,6 +1788,10 @@ class BioRecognizeBackend {
             clock: data.clock || null,
             vis: data.vis || null,
             tok: typeof data.tok === 'number' ? data.tok : null,
+            // Anti-freeze keepalive: 'running' = the page is exempt from
+            // freezing; 'suspended' = the exemption is NOT active and a
+            // focus loss may kill the beats; 'none' = never created.
+            au: data.au || null,
             // Unhandled promise rejections counted by the page. High and
             // climbing while beats also stop means foreign code buried the
             // main thread — a different problem from "our loop died".
