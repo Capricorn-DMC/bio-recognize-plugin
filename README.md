@@ -69,6 +69,7 @@ bio-recognize-plugin/
 - **设备采集**：摄像头帧 → JPEG base64；话筒 PCM → 手动编码 16-bit WAV → base64；后端解码存 `models/captures/` 后走统一的特征提取管线（光谱 / 暗圆分析）。
 - **服务端人脸兜底（handoff 协议）**：页面切到后台时主动交出摄像头（停全部轨道 → `srcObject=null` → `removeAttribute('src')` + `load()`，否则 Windows 上 DirectShow 句柄不会真正释放），并在心跳里带 `vis:hidden + handoff`；后端收到即用 `ffmpeg`（DirectShow，`fps=4, 320x240, rgb24`）抓帧，在 Node 里通过 `vm` 沙箱跑同一个 pico 级联检测器。判定规则与页面一致：无人脸 ≥ `serverFaceAwaySec`（默认 3s）熄屏，黑屏时出现人脸即唤醒；仅判断"有没有人"，身份核验仍由页面负责。
 - **接管不了时**：设备仍被冻结页面占住 → ffmpeg 打开失败，退回键鼠空闲兜底（`blindAwaySec`），不会因为"无画面"就在几秒内熄屏。ffmpeg 自身带 `-t 180` 生命周期上限，`_killProc()` 用 `taskkill /T /F` 硬杀，确保设备不会被泄漏的抓帧进程永久锁死。
+- **卸载 / 停用自净**：后端是 detached 进程，宿主的两条死亡路径都到不了它——删目录（卸载）和插件开关（仅写入 `.dsh-market/state.json` 的 `disabled` 列表，不删文件、不触发钩子）。因此后端每 15s 自检两条：自身文件消失，或出现在 disabled 列表（`@local/bio-recognize` / `bio-recognize`），连续两次确认即执行 `shutdown()`（恢复屏幕亮度 → 退出），遮罩窗口由自身看门狗收尾。另提供手动一条命令 `node server.js --uninstall`：杀后端进程树（含遮罩窗口与 ffmpeg）、按 `_black_level.txt` 恢复亮度、清理 pidfile，然后退出——不依赖 dsh 提供任何卸载入口。
 
 ## 安全注意
 

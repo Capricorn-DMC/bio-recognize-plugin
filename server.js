@@ -2716,6 +2716,52 @@ const port = parseInt(process.argv.find(arg => arg.startsWith('--port='))?.split
 const host = process.argv.find(arg => arg.startsWith('--host='))?.split('=')[1] || '127.0.0.1';
 BACKEND_PORT = port;
 
+// ── `node server.js --uninstall` ─────────────────────────────────────
+// dsh's plugin UI has no uninstall button, and its toggle never reaches the
+// detached backend (files stay, process keeps dimming). This is the plugin's
+// OWN uninstall: kill the running backend tree (overlay + ffmpeg go with it),
+// restore brightness, clear the pidfile, and exit without ever serving.
+if (process.argv.includes('--uninstall')) {
+    const cleaned = [];
+    try {
+        const pid = parseInt(readFileSync(join(MODELS_DIR, '.server.pid'), 'utf8').trim(), 10);
+        if (pid && pid !== process.pid) {
+            // /T takes the whole tree down: the overlay and any capture child.
+            const r = spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { timeout: 8000 });
+            cleaned.push(`backend ${pid} (${r.status === 0 ? 'terminated' : 'not running'})`);
+        }
+    } catch { /* no pidfile — nothing recorded to kill */ }
+    // Belt and suspenders: stray overlay/capture processes pointing into OUR
+    // models dir (crashed before, pidfile lost, etc.).
+    try {
+        const out = spawnSync('powershell', ['-NoProfile', '-Command',
+            `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*${MODELS_DIR}*' } | Select-Object -ExpandProperty ProcessId`],
+            { timeout: 12000, encoding: 'utf8' });
+        for (const line of String(out.stdout || '').split(/\s+/)) {
+            const id = parseInt(line, 10);
+            if (id && id !== process.pid) {
+                spawnSync('taskkill', ['/PID', String(id), '/T', '/F'], { timeout: 8000 });
+                cleaned.push(`stray ${id}`);
+            }
+        }
+    } catch { /* best effort */ }
+    // Restore brightness to the pre-blank level, if one was recorded.
+    try {
+        const lvl = Math.min(parseInt(readFileSync(join(MODELS_DIR, '_black_level.txt'), 'utf8').trim(), 10) || 0, 100);
+        if (lvl > 4) {
+            spawnSync('powershell', ['-NoProfile', '-Command',
+                `Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightnessMethods | ForEach-Object { $_ | Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{Timeout=[uint32]0; Brightness=[byte]${lvl}} | Out-Null }`],
+                { timeout: 8000 });
+            cleaned.push(`brightness → ${lvl}`);
+        }
+    } catch { /* no record — the screen was never blanked */ }
+    try { unlinkSync(join(MODELS_DIR, '.server.pid')); } catch { /* already gone */ }
+    try { writeFileSync(join(MODELS_DIR, '_black_state.txt'), '0', 'utf8'); } catch { /* noop */ }
+    console.log('BioRecognize uninstalled: backend stopped, overlay closed, brightness restored.');
+    if (cleaned.length) console.log('  cleaned: ' + cleaned.join(', '));
+    process.exit(0);
+}
+
 // Bind the port FIRST: the host's start-service call health-checks this port,
 // and initialization now pre-warms a resident PowerShell worker + models.
 // Listening immediately makes "start" succeed instantly; heavy work follows.
@@ -2780,20 +2826,35 @@ function shutdown() {
 // Two strikes (30s) so a directory rebuild / partial update never trips it.
 let uninstallStrikes = 0;
 const uninstallWatch = setInterval(() => {
-    let gone = false;
+    let gone = false, why = '';
     try {
-        gone = !existsSync(join(__dirname, 'server.js')) ||
-               !existsSync(join(__dirname, 'package.json'));
-    } catch { gone = true; }
+        if (!existsSync(join(__dirname, 'server.js')) ||
+            !existsSync(join(__dirname, 'package.json'))) { gone = true; why = 'our files are gone (uninstalled)'; }
+    } catch { gone = true; why = 'stat failed'; }
+    // The host's plugin TOGGLE is a separate death path: it only writes a
+    // "disabled" list into the profile state and never deletes files nor
+    // notifies the detached backend. Read that list directly — if the plugin
+    // shows up in it, the user switched us off and we should stand down too.
+    if (!gone) {
+        try {
+            // __dirname = <profile>/node_modules/@local/<name> → 3 up = profile.
+            const statePath = join(__dirname, '..', '..', '..', '.dsh-market', 'state.json');
+            const raw = JSON.parse(readFileSync(statePath, 'utf8'));
+            const list = Array.isArray(raw.disabled) ? raw.disabled : [];
+            if (list.some(e => typeof e === 'string' && /bio-recognize/i.test(e))) {
+                gone = true; why = 'disabled in dsh plugin settings';
+            }
+        } catch { /* no toggle file — cannot be switched off there */ }
+    }
     if (!gone) { uninstallStrikes = 0; return; }
     uninstallStrikes += 1;
     if (uninstallStrikes < 2) return;
     clearInterval(uninstallWatch);
-    console.log('[Plugin] our files are gone — plugin uninstalled; cleaning up and exiting');
+    console.log(`[Plugin] ${why} — cleaning up and exiting`);
     try {
         appendFileSync(join(MODELS_DIR, 'server.log'),
-            `[Plugin] ${new Date().toISOString()} uninstalled (files deleted) — backend self-terminated\n`);
+            `[Plugin] ${new Date().toISOString()} ${why} — backend self-terminated\n`);
     } catch { /* models dir may be gone too */ }
     shutdown();
-}, 15000);
+}, parseInt(process.env.BIO_TEST_WATCH_MS || '0') || 15000);
 try { uninstallWatch.unref(); } catch { /* noop */ }
