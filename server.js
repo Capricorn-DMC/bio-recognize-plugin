@@ -1631,8 +1631,17 @@ class PresenceEngine {
         // faces=0). A grace shorter than ~1.8s therefore blanks the screen in
         // the middle of a long inference, and the next frame lights it again —
         // exactly the "lights up, goes black once, then stays on" report.
+        //
+        // That floor cost ~2.2s of OFF latency, though. The blind flag (client
+        // marks its own inference-busy frames → sensorBlind freezes the
+        // verdict) now covers exactly those CNN gaps, so the floor is only
+        // needed when we have NO proof the client marks blind frames. Recent
+        // blind evidence → grace collapses to the detector-flicker floor
+        // (~2.8 beats, what a 7% frame-miss rate actually requires); otherwise
+        // keep the historical 1.8s safety net for clients that never mark.
+        const blindProof = this.blindAt && (now - this.blindAt) < 60000;
         const faceGrace = Math.min(
-            Math.max(cfg.faceGraceMs || 450, hbInterval * 2.8, 1800), 4000);
+            Math.max(cfg.faceGraceMs || 450, hbInterval * 2.8, blindProof ? 0 : 1800), 4000);
         const faceEnabled = cfg.faceEnabled !== false;
 
         // A detector only counts as usable while heartbeats still carry its
