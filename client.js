@@ -53,9 +53,10 @@
       section: { marginBottom: 14, padding: 14, background: T.bgLayer1, borderRadius: 12, border: `1px solid ${T.borderL1}` },
       sectionTitle: { fontSize: 14, fontWeight: 600, marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8, color: T.text },
       row: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 },
-      label: { width: 96, flex: '0 0 96px', fontSize: 13, color: T.text2 },
+      label: { width: 88, flex: '0 0 88px', fontSize: 13, color: T.text2 },
       input: { flex: 1, minWidth: 0, padding: '7px 10px', borderRadius: 6, border: `1px solid ${T.borderL2}`, background: T.input, color: T.text, fontSize: 13, outline: 'none' },
       inputSmall: { width: 72, padding: '5px 8px', borderRadius: 6, border: `1px solid ${T.borderL2}`, background: T.input, color: T.text, fontSize: 13, outline: 'none' },
+      inputTime: { width: 64, padding: '5px 6px', borderRadius: 6, border: `1px solid ${T.borderL2}`, background: T.input, color: T.text, fontSize: 13, outline: 'none' },
       btnPrimary: { padding: '7px 14px', borderRadius: 6, border: 'none', background: T.accent, color: '#fff', fontSize: 13, fontWeight: 500, cursor: 'pointer', whiteSpace: 'nowrap' },
       btnSecondary: { padding: '6px 12px', borderRadius: 6, border: `1px solid ${T.borderL2}`, background: T.bgLayer2, color: T.text, fontSize: 12, cursor: 'pointer', whiteSpace: 'nowrap' },
       btnSmall: { padding: '4px 10px', borderRadius: 5, border: 'none', background: T.accent, color: '#fff', fontSize: 12, cursor: 'pointer', whiteSpace: 'nowrap' },
@@ -1801,70 +1802,88 @@
           h('div', { style: s.sectionTitle },
             h('span', null, '⏱️'), h('span', null, '时间参数')
           ),
-          h('div', { style: s.row },
+          // CSS grid, one cell per field: label / input / description. Column
+          // x-positions are owned by the grid, so every input lands on the
+          // same vertical line regardless of label or description length.
+          h('div', {
+            style: {
+              display: 'grid',
+              gridTemplateColumns: '88px 72px 1fr',
+              columnGap: 10, rowGap: 10,
+              alignItems: 'center',
+              marginTop: 10,
+            }
+          },
             h('span', { style: s.label }, '人脸丢失'),
             h('input', {
               type: 'number', value: config.faceGraceMs || 550,
               onChange: e => upd('faceGraceMs', Math.min(Math.max(parseInt(e.target.value) || 550, 400), 3000)),
-              min: 400, max: 3000, step: 50, style: s.inputSmall,
+              min: 400, max: 3000, step: 50, style: s.inputTime,
             }),
-            h('span', { style: { fontSize: 12, color: T.text2 } }, '毫秒看不到人脸就视为中断')
-          ),
-          h('div', { style: s.row },
+            h('span', { style: { fontSize: 12, color: T.text2, display: 'flex' } },
+              h('span', { style: { marginRight: 8 } }, 'ms'),
+              h('span', null, '看不到人脸就视为中断')),
+
             h('span', { style: s.label }, '离场确认'),
             h('input', {
               type: 'number', value: config.awayDelayMs || 400,
               onChange: e => upd('awayDelayMs', Math.min(Math.max(parseInt(e.target.value) || 400, 300), 5000)),
-              min: 300, max: 5000, step: 50, style: s.inputSmall,
+              min: 300, max: 5000, step: 50, style: s.inputTime,
             }),
-            h('span', { style: { fontSize: 12, color: T.text2 } }, '毫秒持续无人即熄屏（调大可防抖动）')
-          ),
-          h('div', { style: { ...s.row, marginBottom: 0 } },
+            h('span', { style: { fontSize: 12, color: T.text2, display: 'flex' } },
+              h('span', { style: { marginRight: 8 } }, 'ms'),
+              h('span', null, '持续无人即熄屏（调大可防抖动）')),
+
             h('span', { style: s.label }, '亮屏确认'),
             h('input', {
               type: 'number', value: config.wakeHoldMs || 250,
               onChange: e => upd('wakeHoldMs', Math.min(Math.max(parseInt(e.target.value) || 250, 100), 3000)),
-              min: 100, max: 3000, step: 50, style: s.inputSmall,
+              min: 100, max: 3000, step: 50, style: s.inputTime,
             }),
-            h('span', { style: { fontSize: 12, color: T.text2 } }, '毫秒持续识别到本人才亮屏')
-          ),
-          h('div', { style: { ...s.row, marginBottom: 0 } },
+            h('span', { style: { fontSize: 12, color: T.text2, display: 'flex' } },
+              h('span', { style: { marginRight: 8 } }, 'ms'),
+              h('span', null, '持续识别到本人才亮屏')),
+
             h('span', { style: s.label }, '无摄像头熄屏'),
             h('input', {
               type: 'number',
-              value: Math.max(1, Math.round((config.noCamIdleSec || 300) / 60)),
-              onChange: e => upd('noCamIdleSec', Math.min(Math.max((parseInt(e.target.value) || 5) * 60, 10), 3600)),
-              min: 1, max: 60, step: 1, style: s.inputSmall,
+              value: config.noCamIdleSec || 300,
+              onChange: e => upd('noCamIdleSec', Math.min(Math.max(parseInt(e.target.value) || 300, 10), 3600)),
+              min: 10, max: 3600, step: 10, style: s.inputTime,
             }),
-            h('span', { style: { fontSize: 12, color: T.text2 } }, '分钟键鼠空闲后熄屏（仅键鼠节能模式生效）')
-          ),
-          // Page frozen / closed: no face channel exists at all. The server
-          // falls back to OS input idle, and this is how fast it reacts.
-          // Seconds with decimals: 0.5 blanks as fast as the face path but
-          // also blanks whenever you pause to read; 10s is the usable
-          // default. The face path (page alive) stays at ~2s regardless.
-          h('div', { style: { ...s.row, marginBottom: 0 } },
+            h('span', { style: { fontSize: 12, color: T.text2, display: 'flex' } },
+              h('span', { style: { marginRight: 8 } }, 's'),
+              h('span', null, '键鼠空闲后熄屏（仅键鼠节能模式生效）')),
+
+            // Page frozen / closed: no face channel exists at all. The server
+            // falls back to OS input idle, and this is how fast it reacts.
+            // Seconds with decimals: 0.5 blanks as fast as the face path but
+            // also blanks whenever you pause to read; 10s is the usable
+            // default. The face path (page alive) stays at ~2s regardless.
             h('span', { style: s.label }, '页面失联熄屏'),
             h('input', {
               type: 'number',
               value: Math.round((config.blindAwaySec != null ? config.blindAwaySec : 10) * 10) / 10,
               onChange: e => upd('blindAwaySec', Math.min(Math.max(parseFloat(e.target.value) || 10, 0.5), 600)),
-              min: 0.5, max: 600, step: 0.5, style: s.inputSmall,
+              min: 0.5, max: 600, step: 0.5, style: s.inputTime,
             }),
-            h('span', { style: { fontSize: 12, color: T.text2 } }, '秒键鼠空闲后熄屏（页面被后台冻结、无人脸信号时；太小会把“停下阅读”也判为离开）')
-          ),
-          // Server-side face fallback: when the page is hidden it hands the
-          // camera to the backend, which keeps watching with its own copy of
-          // the detector. This is how fast the backend blanks on "no face".
-          h('div', { style: { ...s.row, marginBottom: 0 } },
-            h('span', { style: s.label }, '后台熄屏（人脸）'),
+            h('span', { style: { fontSize: 12, color: T.text2, display: 'flex' } },
+              h('span', { style: { marginRight: 8 } }, 's'),
+              h('span', null, '键鼠空闲后熄屏（页面被后台冻结、无人脸信号时；太小会把“停下阅读”也判为离开）')),
+
+            // Server-side face fallback: when the page is hidden it hands the
+            // camera to the backend, which keeps watching with its own copy of
+            // the detector. This is how fast the backend blanks on "no face".
+            h('span', { style: s.label }, '后台熄屏'),
             h('input', {
               type: 'number',
               value: config.serverFaceAwaySec != null ? config.serverFaceAwaySec : 3,
               onChange: e => upd('serverFaceAwaySec', Math.min(Math.max(parseFloat(e.target.value) || 3, 1), 600)),
-              min: 1, max: 600, step: 1, style: s.inputSmall,
+              min: 1, max: 600, step: 1, style: s.inputTime,
             }),
-            h('span', { style: { fontSize: 12, color: T.text2 } }, '秒无人脸后熄屏（dsh 在后台时后端直接用摄像头检测，与前台人脸路径同速）')
+            h('span', { style: { fontSize: 12, color: T.text2, display: 'flex' } },
+              h('span', { style: { marginRight: 8 } }, 's'),
+              h('span', null, '无人脸后熄屏（dsh 在后台时后端直接用摄像头检测，与前台人脸路径同速）'))
           )
         ),
 
