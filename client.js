@@ -694,6 +694,19 @@
       },
 
       _reviveCheck() {
+        // While hidden, the page is supposed to have given the camera UP
+        // (handoff). But a single release can be silently swallowed by the
+        // browser, and a reviver restart can re-acquire the device with nobody
+        // ever releasing it again — the server then sees "camera busy",
+        // has no picture, and the blind-away path blanks the screen under
+        // someone who is sitting right there. Re-assert the release every ~8s
+        // while hidden: idempotent (no tracks, empty srcObject) and cheap.
+        if (this.handoff && document.hidden && !this.stream) {
+          this._handoffTick = (this._handoffTick || 0) + 1;
+          if (this._handoffTick >= 4) { this._handoffTick = 0; this._handoffCamera(); }
+        } else {
+          this._handoffTick = 0;
+        }
         if (!this.intent) return;
         if (!this.intentToken || !this.tokens.has(this.intentToken)) {
           console.warn('[Heartbeat] intent lost its token — re-acquiring');

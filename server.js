@@ -1048,7 +1048,14 @@ class FaceFallback {
                         : gone
                             ? `camera device not found (${this.camera})`
                             : `camera open failed (exit ${code})${stderrTail ? ': ' + stderrTail.slice(0, 120) : ''}`;
-                    this.retryAt = Date.now() + 10000;
+                    // Busy is usually TRANSIENT: the page's release is
+                    // asynchronous on Windows (DirectShow drops the handle a
+                    // beat after the tracks stop). A 10s backoff meant the
+                    // takeover sat idle long after the device was actually
+                    // free — long enough for the blind-away path to blank the
+                    // screen under someone sitting right there. 2.5s keeps
+                    // the retry loop tight without hammering DirectShow.
+                    this.retryAt = Date.now() + (busy ? 2500 : 10000);
                     this.active = false;
                     // Only clear the reference if it is still OURS: a late
                     // close event from an older process must not orphan the
